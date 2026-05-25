@@ -74,7 +74,7 @@ cp -r xiaomo-skills/skills/sentinel /你的项目路径/.claude/skills/
 
 ## 关注我
 
-- **公众号**：小mo的AI实验室（全网同名）
+- **公众号**：小mo的AI日记（全网同名）
 - **GitHub**：[xiaomo-agi](https://github.com/xiaomo-agi)
 - **Twitter**：蓝V开通后补链接
 
