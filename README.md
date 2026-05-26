@@ -20,6 +20,7 @@
 |---|---|
 | [tao-traffic](./skills/tao-traffic/) | 流量思维框架。13 个模型（占位/Match/下拉词/流量结构/超级客户/千川...），帮你诊断流量问题 |
 | [sentinel](./skills/sentinel/) | 飞书妙记哨兵。定时扫描新录音，自动提取待办、素材、金句，飞书通知你 |
+| [mycc](./skills/mycc/) | Claude Code 小程序后端。手机/网页远程操控 CC，飞书双向通信，支持文件收发、流式卡片、Agent Teams |
 
 > 持续更新中。有新 Skill 会加进来，Star 一下不会错过。
 
@@ -36,6 +37,7 @@ git clone https://github.com/xiaomo-agi/xiaomo-skills.git
 # 复制你想用的 skill 到你的项目
 cp -r xiaomo-skills/skills/tao-traffic /你的项目路径/.claude/skills/
 cp -r xiaomo-skills/skills/sentinel /你的项目路径/.claude/skills/
+cp -r xiaomo-skills/skills/mycc /你的项目路径/.claude/skills/
 ```
 
 每个 skill 文件夹里的 SKILL.md 是主文件，打开就知道怎么用。
@@ -67,6 +69,21 @@ cp -r xiaomo-skills/skills/sentinel /你的项目路径/.claude/skills/
 - 低价值 → 静默归档
 
 **依赖**：需要 [lark-cli](https://github.com/webernfe/lark-cli) 和飞书授权。
+
+### mycc
+
+Claude Code 小程序后端服务。让你的手机/网页可以远程操控本地的 Claude Code。
+
+- **多通道输出**：Web（网页/小程序）+ 飞书，可同时启用
+- **飞书双向通信**：发消息到飞书 + 接收飞书消息回复，支持文本/图片/文件
+- **流式卡片**：AI 回复实时更新到单张卡片，替代逐条消息轰炸
+- **Agent Teams**：多 Agent 协作，一个后端管理多个项目
+- **文件收发**：支持在飞书收发 PDF/Word/Excel 等文件
+- **完整 API**：配对、聊天、历史记录、Skills 列表、SSE 实时广播
+
+**使用**：安装到 `.claude/skills/mycc/`，配置 `.env` 后 `/mycc` 启动后端。
+
+**依赖**：Node.js 18+，cloudflared（外网穿透）
 
 ---
 
