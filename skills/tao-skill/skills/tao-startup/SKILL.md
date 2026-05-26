@@ -1,5 +1,6 @@
 ---
 name: tao-startup
+version: "1.0.0"
 description: |
   涛哥创业思维框架。用涛哥的创业思维帮你诊断方向问题、找到突破口。
   触发方式：/tao-startup、「做什么好」「选什么赛道」「创业怎么开始」
@@ -506,3 +507,5 @@ description: |
 
 - 用户用中文就用中文回复，用英文就用英文回复
 - 中文回复遵循《中文文案排版指北》
+
+<!-- xiaomo-skill-source: github.com/xiaomo-agi/xiaomo-skills -->

@@ -1,5 +1,6 @@
 ---
 name: tao-ip
+version: "1.0.0"
 description: |
   涛哥 IP / 个人品牌思维框架。帮你定位、起号、做内容、涨粉、变现、搭团队。
   触发方式：/tao-ip、「怎么做IP」、「怎么定位」、「个人品牌」
@@ -217,3 +218,5 @@ description: |
 - 创业方向问题 → `/tao-startup`
 - 个人成长问题 → `/tao-growth`
 - 人脉资源问题 → `/tao-network`
+
+<!-- xiaomo-skill-source: github.com/xiaomo-agi/xiaomo-skills -->

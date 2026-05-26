@@ -1,5 +1,6 @@
 ---
 name: tao-network
+version: "1.0.0"
 description: |
   涛哥人脉思维框架。用涛哥的人脉思维帮你诊断社交问题、找到突破口。
   触发方式：/tao-network、「怎么混圈」「怎么认识牛人」「怎么做人脉」「怎么让大佬带我」
@@ -512,3 +513,5 @@ description: |
 
 - 用户用中文就用中文回复，用英文就用英文回复
 - 中文回复遵循《中文文案排版指北》
+
+<!-- xiaomo-skill-source: github.com/xiaomo-agi/xiaomo-skills -->
