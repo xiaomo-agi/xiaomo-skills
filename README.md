@@ -91,6 +91,14 @@ cp -r xiaomo-skills/skills/sentinel /你的项目路径/.claude/skills/
 
 ---
 
+## 鸣谢
+
+本项目在开发过程中受益于以下优秀的开源工具和创作者：
+
+- **[sk-info-assets](https://github.com/situker/sk-info-assets)** by 金鑫 — 长文本信息资产分析框架，哨兵系统的长录音精读能力基于此实现
+
+---
+
 ## License
 
 MIT — 随便用，注明出处就行。
