@@ -81,6 +81,21 @@ cp -r xiaomo-skills/skills/sentinel /你的项目路径/.claude/skills/
 
 ---
 
+## 反馈 & Issue
+
+发现 bug、有功能建议、或者某个 Skill 不好用？直接开 Issue：
+
+1. 点仓库上方的 **Issues** → **New issue**
+2. 选对应模板（Bug report / Feature request）
+3. 尽量描述清楚：
+   - 你用的 Claude Code 版本
+   - 触发方式（怎么复现）
+   - 实际输出 vs 期望输出
+
+也可以直接在公众号后台留言，看到会回。
+
+---
+
 ## 关注我
 
 - **公众号**：小mo的AI日记（全网同名）
