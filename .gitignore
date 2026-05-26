@@ -4,11 +4,3 @@ node_modules/
 .DS_Store
 Thumbs.db
 
-# 涛哥系列 skill（本地留存，待涛哥确认后再公开）
-skills/tao/
-skills/tao-content/
-skills/tao-startup/
-skills/tao-sell/
-skills/tao-growth/
-skills/tao-health/
-skills/tao-network/
