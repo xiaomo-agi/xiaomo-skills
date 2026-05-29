@@ -48,12 +48,15 @@
 ```
 获取妙记 {token}（标题：{title}）的转录内容。
 
+⚠️ 不要尝试获取录音文件，录音经常被删除。直接搜索飞书文档即可。
+
 步骤：
-1. lark-cli minutes minutes get --params '{"minute_token":"{token}"}' --as user
-2. 从结果中提取 note_id
-3. lark-cli docs +search --query "文字记录：{title_keywords}" --as user --format pretty
-4. 从结果中提取 doc_token
-5. lark-cli docs +fetch --doc <doc_token> --as user --format pretty
+1. lark-cli docs +search --query "智能纪要：{title_keywords}" --as user --format pretty
+   → 搜索智能纪要文档（优先），获取 doc_token
+   → 如果搜索不到智能纪要，再搜索 "文字记录：{title关键词}"
+
+2. lark-cli docs +fetch --doc <doc_token> --as user --format pretty
+   → 读取文档内容
 
 验证：返回内容 > 50 字符且不含错误信息。
 失败：标记为 fetch_failed，入失败队列。
@@ -64,10 +67,10 @@
 ## 4. 短录音提取（待办、素材、金句）
 
 ```
-阅读以下妙记转录内容，提取三类信息：
+阅读以下妙记文档内容（智能纪要或文字记录），提取三类信息：
 
-【转录内容】
-{transcript}
+【文档内容】
+{document}
 
 提取要求：
 
@@ -75,15 +78,18 @@
    - "下周会让我做/改某事吗？" → 否 → 降级，不提
    - "能多次复用吗？" → 是 → 高价值，重点标注
    - "有明确截止时间吗？" → 是 → 标注 deadline
+   - 智能纪要中已标注的「待办」部分优先提取
 
 2. 内容素材（可直接用于社媒）：
    - 金句（可发朋友圈/短视频文案）
    - 观点/案例（可写成公众号/社媒帖子）
    - 标注：[来源:原话/引申] + 适合渠道（朋友圈/视频号/公众号/推特/小红书）
+   - 智能纪要中已标注的「金句时刻」优先提取
 
 3. 金句存档：
    - 格式：> "原话" — 上下文说明
-   - 只从说话人原话提取，不从 AI 摘要提取
+   - 优先从智能纪要的「金句时刻」提取
+   - 其次从「关键决策」「章节摘要」中提取
    - 没有就明确说"无金句"
 
 输出格式：
@@ -111,7 +117,14 @@
 妙记 {token}（标题：{title}，时长：{duration}）为长录音。
 触发 sk-info-assets skill 进行完整的 8 节信息资产分析。
 
-先获取转录内容，然后按 sk-info-assets 流程处理。
+⚠️ 不要尝试获取录音文件。直接搜索飞书文档：
+1. lark-cli docs +search --query "智能纪要：{title关键词}" --as user --format pretty
+2. lark-cli docs +fetch --doc <doc_token> --as user --format pretty
+
+智能纪要已包含总结、章节、待办、金句、关键决策等结构化内容。
+如智能纪要缺失，再搜索 "文字记录：{title关键词}"。
+
+获取文档内容后，按 sk-info-assets 流程处理。
 处理完成后，摘要发飞书通知。
 ```
 
@@ -122,8 +135,12 @@
 ```
 妙记 {token}（标题：{title}）为流水账类录音。
 
+⚠️ 不要尝试获取录音文件。直接搜索飞书文档：
+1. lark-cli docs +search --query "文字记录：{title关键词}" --as user --format pretty
+2. lark-cli docs +fetch --doc <doc_token> --as user --format pretty
+
 执行 flomo-journal 完整流程：
-1. 获取转录原话
+1. 读取文字记录原话
 2. 查询 Bitable 当日工作记录
 3. 整合原话 + 工作记录
 4. 生成摘要，发飞书给用户确认

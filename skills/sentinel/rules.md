@@ -110,18 +110,33 @@
 
 ## 获取转录的正确路径
 
+⚠️ **重要：不要尝试获取录音文件**。用户飞书中的妙记录音经常被删除，但文字记录和智能纪要文档始终保留。直接搜索文档即可。
+
+**推荐路径（优先读智能纪要，内容精炼有结构）：**
+
 ```
-1. lark-cli minutes minutes get --params '{"minute_token":"xxx"}' --as user
-   → 获取 note_id
+1. lark-cli docs +search --query "智能纪要：<标题关键词>" --as user --format pretty
+   → 搜索智能纪要文档，获取 doc_token
 
-2. lark-cli docs +search --query "文字记录：<标题关键词>" --as user --format pretty
-   → 搜索转录文档，获取 doc_token
-
-3. lark-cli docs +fetch --doc <doc_token> --as user --format pretty
-   → 读取转录全文
+2. lark-cli docs +fetch --doc <doc_token> --as user --format pretty
+   → 读取智能纪要（含总结、章节、待办、金句、关键决策）
 ```
 
-**禁止**：`lark-cli minutes +get`（不存在）、`lark-cli vc +notes`（缺 scope）、web reader（额度少）
+**备选路径（智能纪要缺失时读完整文字记录）：**
+
+```
+1. lark-cli docs +search --query "文字记录：<标题关键词>" --as user --format pretty
+   → 搜索文字记录文档，获取 doc_token
+
+2. lark-cli docs +fetch --doc <doc_token> --as user --format pretty
+   → 读取完整转录
+```
+
+**废弃路径（不要再用）：**
+- `lark-cli minutes minutes get` → 录音常删，失败率高，浪费时间
+- `lark-cli vc +notes` → 依赖录音，同样会失败
+- `lark-cli minutes +get` → 不存在
+- web reader → 额度少
 
 ---
 
