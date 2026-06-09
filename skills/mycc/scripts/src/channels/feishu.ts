@@ -38,6 +38,8 @@ export interface FeishuChannelConfig {
   verificationToken?: string;
   /** 是否显示工具调用：true（显示）或 false（不显示），默认 true */
   showToolUse?: boolean;
+  /** 通道标识（用于日志区分，如 A/B/C） */
+  label?: string;
 }
 
 /**
@@ -61,6 +63,7 @@ export class FeishuChannel implements MessageChannel {
   readonly id = "feishu";
 
   private config: FeishuChannelConfig;
+  private label: string;
   private accessToken: string | null = null;
   private tokenExpireTime: number = 0;
   private pendingImages = new Map<string, string>(); // sessionId → image_key
@@ -70,11 +73,29 @@ export class FeishuChannel implements MessageChannel {
   private eventDispatcher: Lark.EventDispatcher | null = null;
   private messageCallback: ((message: string, images?: Array<{ data: string; mediaType: string }>, files?: Array<{ filePath: string; fileName: string }>, messageId?: string) => void) | null = null;
 
+  // 消息合并缓冲（解决同时发图+文字时图片被并发锁丢弃的问题）
+  private messageBuffer: Array<{ text: string; images?: Array<{ data: string; mediaType: string }>; files?: Array<{ filePath: string; fileName: string }>; messageId?: string }> = [];
+  private bufferTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastSenderId: string | null = null;
+  private readonly BUFFER_DELAY = 300; // ms，等待后续消息到达
+
   // 表态相关（"正在输入" emoji）
   private currentMessageId: string | null = null;
   private currentReactionId: string | null = null;
 
+  /** 最近一次消息的上下文（用于群路由判断） */
+  private lastMessageContext: { chatId?: string; mentions?: Array<{ id: string; id_type?: string; name?: string }> } = {};
+
+  /** 本 bot 的 open_id（用于群聊@路由判断） */
+  private botOpenId: string | null = null;
+
+  /** 日志前缀 */
+  private get lp(): string {
+    return this.label ? `[Feishu-${this.label}]` : "[Feishu]";
+  }
+
   constructor(config?: FeishuChannelConfig) {
+    this.label = config?.label || "";
     // 从环境变量读取配置
     this.config = config || {
       appId: process.env.FEISHU_APP_ID || "",
@@ -96,7 +117,7 @@ export class FeishuChannel implements MessageChannel {
   filter(event: SSEEvent): boolean {
     const eventType = event.type as string;
     // 调试：记录所有事件类型（包括被过滤的）
-    console.log(`[FeishuChannel] [FILTER] 收到事件类型: ${eventType}`);
+    console.log(`${this.lp} [FILTER] 收到事件类型: ${eventType}`);
 
     const textOnlyTypes = ["text", "content_block_delta", "system", "assistant"];
     const allTypes = ["text", "content_block_delta", "system", "assistant", "tool_use"];
@@ -243,6 +264,38 @@ export class FeishuChannel implements MessageChannel {
   }
 
   /**
+   * 刷新消息缓冲：合并缓冲的多条消息并一次性回调
+   * 解决用户同时发图+文字时，图片被并发锁丢弃的问题
+   */
+  private flushMessageBuffer(): void {
+    if (this.messageBuffer.length === 0 || !this.messageCallback) return;
+
+    // 合并所有缓冲的消息
+    let mergedText = "";
+    const mergedImages: Array<{ data: string; mediaType: string }> = [];
+    const mergedFiles: Array<{ filePath: string; fileName: string }> = [];
+    let firstMessageId: string | undefined;
+
+    for (const msg of this.messageBuffer) {
+      if (msg.text && msg.text.trim()) {
+        mergedText += (mergedText ? "\n" : "") + msg.text.trim();
+      }
+      if (msg.images) mergedImages.push(...msg.images);
+      if (msg.files) mergedFiles.push(...msg.files);
+      if (!firstMessageId && msg.messageId) firstMessageId = msg.messageId;
+    }
+
+    console.log(`[FeishuChannel] ✓ 合并 ${this.messageBuffer.length} 条消息: ${mergedText ? mergedText.substring(0, 50) : "[图片/文件]"}... [${mergedImages.length} 图, ${mergedFiles.length} 文件]`);
+
+    this.messageCallback(mergedText, mergedImages.length > 0 ? mergedImages : undefined, mergedFiles.length > 0 ? mergedFiles : undefined, firstMessageId);
+
+    // 清空缓冲
+    this.messageBuffer = [];
+    this.lastSenderId = null;
+    this.bufferTimer = null;
+  }
+
+  /**
    * 启动飞书通道（验证凭证 + 启动 WebSocket）
    */
   async start(): Promise<void> {
@@ -260,6 +313,9 @@ export class FeishuChannel implements MessageChannel {
 
     console.log("[FeishuChannel] ✓ Credentials validated");
     console.log(`[FeishuChannel] Will send to: ${this.config.receiveUserId || "未配置接收用户"}`);
+
+    // 获取本 bot 的 open_id（用于群聊@路由判断）
+    await this.fetchBotOpenId();
 
     // 启动 WebSocket 连接（如果配置了）
     if (this.config.connectionMode === "websocket") {
@@ -297,6 +353,12 @@ export class FeishuChannel implements MessageChannel {
             const event = data as any;
             const messageId = event?.message?.message_id;
 
+            // 打印发送者 open_id，方便配置 RECEIVE_USER_ID
+            const senderId = event?.sender?.sender_id?.open_id || event?.sender?.id?.open_id;
+            if (senderId) {
+              console.log(`[FeishuChannel] [DEBUG] 发送者 open_id: ${senderId}`);
+            }
+
             // 添加"正在输入"表态（敲键盘 emoji）
             if (messageId) {
               this.addTypingIndicator(messageId).catch(() => {
@@ -306,16 +368,37 @@ export class FeishuChannel implements MessageChannel {
 
             // await 解析结果（图片/文件下载是异步的）
             const parsed = await this.parseFeishuMessage(event, messageId);
-            if (parsed && this.messageCallback) {
-              const { text, images, files } = parsed;
-              if (text || images || files) {
-                console.log(`[FeishuChannel] ✓ 收到消息: ${text ? text.substring(0, 50) : images ? "[图片]" : "[文件]"}...`);
-                // 传递消息 ID，以便后续可以删除表态
-                this.messageCallback(text, images, files, messageId);
-              } else {
-                console.log("[FeishuChannel] [DEBUG] 解析消息内容为空");
-              }
+            if (!parsed || !this.messageCallback) {
+              console.log("[FeishuChannel] [DEBUG] 解析消息内容为空或无回调");
+              return;
             }
+
+            const { text, images, files } = parsed;
+            if (!text && !images && !files) {
+              console.log("[FeishuChannel] [DEBUG] 解析消息内容为空");
+              return;
+            }
+
+            // 消息合并缓冲：同用户短时间内多条消息合并（文字+图片）
+            if (this.bufferTimer) {
+              clearTimeout(this.bufferTimer);
+              this.bufferTimer = null;
+            }
+
+            // 检查是否换人了（不同用户消息不合并）
+            if (this.lastSenderId && this.lastSenderId !== senderId) {
+              // 换人，立即 flush 旧消息
+              this.flushMessageBuffer();
+            }
+
+            this.lastSenderId = senderId;
+            this.messageBuffer.push({ text: text || "", images, files, messageId });
+
+            console.log(`[FeishuChannel] ✓ 收到消息（缓冲中）: ${text ? text.substring(0, 50) : images ? "[图片]" : "[文件]"}...`);
+
+            this.bufferTimer = setTimeout(() => {
+              this.flushMessageBuffer();
+            }, this.BUFFER_DELAY);
           } catch (err) {
             console.error("[FeishuChannel] 消息处理错误:", err);
           }
@@ -350,10 +433,11 @@ export class FeishuChannel implements MessageChannel {
         appSecret: this.config.appSecret,
         domain: Lark.Domain.Feishu,
         loggerLevel: Lark.LoggerLevel.info,
+        autoReconnect: true,
       });
 
       // 启动连接
-      this.wsClient.start({ eventDispatcher: this.eventDispatcher });
+      await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
       console.log("[FeishuChannel] ✓ WebSocket 已启动");
       console.log("[FeishuChannel] [INFO] 已注册事件: im.message.receive_v1, im.message.message_read_v1, im.chat.member.bot.added_v1, im.chat.member.bot.deleted_v1");
     } catch (err) {
@@ -366,10 +450,16 @@ export class FeishuChannel implements MessageChannel {
    */
   private async parseFeishuMessage(event: any, messageId?: string): Promise<{ text: string; images?: Array<{ data: string; mediaType: string }>; files?: Array<{ filePath: string; fileName: string }> } | null> {
     try {
-      // 事件结构: event.sender + event.message（不是 event.event.message）
-      if (!event?.message) return Promise.resolve(null);
+      // 保存消息上下文（用于群路由判断 @all）
+      const message = event?.message;
+      this.lastMessageContext = {
+        chatId: message?.chat_id,
+        mentions: message?.mentions || [],
+      };
 
-      const message = event.message;
+      // 事件结构: event.sender + event.message（不是 event.event.message）
+      if (!message) return null;
+
       const messageType = message.message_type;
       const content = message.content;
 
@@ -715,7 +805,7 @@ export class FeishuChannel implements MessageChannel {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${this.accessToken}`,
-          "Content-Type": "application/json",
+          "Content-Type": "application/json; charset=utf-8",
         },
         body: JSON.stringify(responseBody),
       });
@@ -756,7 +846,7 @@ export class FeishuChannel implements MessageChannel {
           method: "POST",
           headers: {
             Authorization: `Bearer ${this.accessToken}`,
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
           },
           body: JSON.stringify(responseBody),
         }
@@ -789,7 +879,7 @@ export class FeishuChannel implements MessageChannel {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${this.accessToken}`,
-          "Content-Type": "application/json",
+          "Content-Type": "application/json; charset=utf-8",
         },
         body: JSON.stringify({
           receive_id: userId,
@@ -826,7 +916,7 @@ export class FeishuChannel implements MessageChannel {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${this.accessToken}`,
-          "Content-Type": "application/json",
+          "Content-Type": "application/json; charset=utf-8",
         },
         body: JSON.stringify({
           receive_id: userId,
@@ -952,7 +1042,7 @@ export class FeishuChannel implements MessageChannel {
     try {
       const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json; charset=utf-8" },
         body: JSON.stringify({
           app_id: this.config.appId,
           app_secret: this.config.appSecret,
@@ -995,7 +1085,7 @@ export class FeishuChannel implements MessageChannel {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${this.accessToken}`,
-          "Content-Type": "application/json",
+          "Content-Type": "application/json; charset=utf-8",
         },
         body: JSON.stringify({
           reaction_type: {
@@ -1072,6 +1162,49 @@ export class FeishuChannel implements MessageChannel {
    */
   getConfig(): FeishuChannelConfig {
     return this.config;
+  }
+
+  /**
+   * 获取本 bot 的 open_id（群聊@路由判断用）
+   */
+  getBotOpenId(): string | null {
+    return this.botOpenId;
+  }
+
+  /**
+   * 获取最近一次消息的上下文（群路由判断用）
+   */
+  getLastMessageContext(): { chatId?: string; mentions?: Array<{ id: string; id_type?: string; name?: string }> } {
+    return this.lastMessageContext;
+  }
+
+  /**
+   * 从飞书 API 获取本 bot 的 open_id
+   */
+  private async fetchBotOpenId(): Promise<void> {
+    try {
+      if (!this.accessToken || Date.now() > this.tokenExpireTime) {
+        this.accessToken = await this.getAccessToken();
+        if (!this.accessToken) return;
+      }
+
+      const response = await fetch("https://open.feishu.cn/open-apis/bot/v3/info", {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${this.accessToken}`,
+        },
+      });
+
+      const result = await response.json() as any;
+      if (result.code === 0 && result.bot?.open_id) {
+        this.botOpenId = result.bot.open_id;
+        console.log(`${this.lp} ✓ Bot open_id: ${this.botOpenId}`);
+      } else {
+        console.warn(`${this.lp} ⚠ 无法获取 bot open_id:`, result.msg || "未知错误");
+      }
+    } catch (error) {
+      console.warn(`${this.lp} ⚠ 获取 bot open_id 失败:`, error);
+    }
   }
 
   /**

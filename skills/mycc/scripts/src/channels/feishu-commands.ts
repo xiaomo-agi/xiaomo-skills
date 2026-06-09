@@ -20,9 +20,31 @@ export interface FeishuCommandsDeps {
 export class FeishuCommands {
   private deps: FeishuCommandsDeps;
   private _currentSessionId: string | null = null;
+  /** 劫持用的回复通道（群路由时用） */
+  private replyChannel: any = null;
+  /** 小工身份名称（群聊路由时用于身份标识） */
+  agentName: string = "";
+  /** 处理锁：防止同一通道并发处理多条消息 */
+  private processing = false;
+  private processingTimeoutMs = 120_000; // 2分钟超时自动解锁
 
   constructor(deps: FeishuCommandsDeps) {
     this.deps = deps;
+  }
+
+  /** 获取实际使用的飞书通道（支持劫持） */
+  private get effectiveChannel(): any {
+    return this.replyChannel || this.deps.feishuChannel;
+  }
+
+  /** 设置劫持回复通道（AgentRouter 用） */
+  setReplyChannel(channel: any): void {
+    this.replyChannel = channel;
+  }
+
+  /** 清除劫持回复通道 */
+  clearReplyChannel(): void {
+    this.replyChannel = null;
   }
 
   get currentSessionId(): string | null {
@@ -40,6 +62,23 @@ export class FeishuCommands {
    * @param messageId - 原始消息 ID，用于回复和流式卡片
    */
   async processMessage(message: string, images?: Array<{ data: string; mediaType: string }>, files?: Array<{ filePath: string; fileName: string }>, messageId?: string): Promise<void> {
+    // 并发锁：如果正在处理中，拒绝新消息
+    if (this.processing) {
+      console.warn(`[CC] ⚠ 通道正在处理中，拒绝新消息: ${message.substring(0, 30)}...`);
+      await this.sendToFeishu("上一条消息还在处理中，请稍后再试。");
+      return;
+    }
+    this.processing = true;
+    console.log(`[CC] 🔒 处理锁已锁定`);
+    // 超时自动解锁（防止异常情况下永久锁定）
+    const unlockTimer = setTimeout(() => {
+      if (this.processing) {
+        console.error(`[CC] ⚠ processMessage 超时自动解锁 (${this.processingTimeoutMs}ms)`);
+        this.processing = false;
+      }
+    }, this.processingTimeoutMs);
+
+    try {
     console.log(`[CC] 收到飞书消息: ${message.substring(0, 50)}...${images ? ` [${images.length} 张图片]` : ""}${files ? ` [${files.length} 个文件]` : ""}`);
 
     const trimmedMessage = message.trim();
@@ -88,7 +127,7 @@ export class FeishuCommands {
 
     // 尝试启动流式卡片（单卡片实时更新，替代逐条消息）
     let streamingSession: FeishuStreamingSession | null = null;
-    const feishuChannel = this.deps.feishuChannel;
+    const feishuChannel = this.effectiveChannel;
 
     if (feishuChannel && messageId) {
       try {
@@ -189,7 +228,16 @@ export class FeishuCommands {
         await feishuChannel.clearTypingIndicator();
       }
     }
+  } catch (err) {
+    console.error(`[CC] processMessage 未捕获错误:`, err);
+  } finally {
+    clearTimeout(unlockTimer);
+    if (this.processing) {
+      console.log(`[CC] 🔓 处理锁已解锁`);
+      this.processing = false;
+    }
   }
+}
 
   /**
    * 处理飞书命令
@@ -199,7 +247,8 @@ export class FeishuCommands {
     const cmd = parts[0].toLowerCase();
     const args = parts.slice(1);
 
-    console.log(`[CC] 处理飞书命令: ${cmd}`);
+    console.log(`[CC] 📋 处理飞书命令: ${cmd}`);
+    const startTime = Date.now();
 
     try {
       switch (cmd) {
@@ -227,6 +276,10 @@ export class FeishuCommands {
           await this.handleDevice();
           break;
 
+        case "/agents":
+          await this.handleAgents();
+          break;
+
         case "/help":
         case "/?":
           await this.handleHelp();
@@ -239,6 +292,8 @@ export class FeishuCommands {
       console.error(`[CC] 命令处理错误:`, err);
       await this.sendToFeishu(`执行命令时出错: ${err instanceof Error ? err.message : String(err)}`);
     }
+    const elapsed = Date.now() - startTime;
+    console.log(`[CC] ✅ 命令处理完成 (${elapsed}ms)`);
   }
 
   private async handleNewSession(title?: string): Promise<void> {
@@ -479,6 +534,26 @@ export class FeishuCommands {
     }
   }
 
+  private async handleAgents(): Promise<void> {
+    const agents = [
+      { name: "技术助手", desc: "代码、编程、bug排查、部署" },
+      { name: "写作助手", desc: "文案、文章、公众号、润色" },
+      { name: "数据分析", desc: "数据分析、表格、统计、报表" },
+      { name: "社媒运营", desc: "社媒运营、内容策略、涨粉" },
+      { name: "通用助手", desc: "兜底：不属于以上分类的问题" },
+    ];
+
+    let output = "当前在线小工\n\n";
+    agents.forEach((agent, index) => {
+      output += `${index + 1}. **${agent.name}** — ${agent.desc}\n`;
+    });
+    output += "\n使用方式：\n";
+    output += "• @all — 智能分配给最适合的小工\n";
+    output += "• @具体小工 — 直接点名（如@技术助手）\n";
+
+    await this.sendToFeishu(output);
+  }
+
   private async handleHelp(): Promise<void> {
     const helpText =
       "飞书命令帮助\n\n" +
@@ -487,6 +562,8 @@ export class FeishuCommands {
       "/sessions - 查看历史会话\n" +
       "/switch <序号> - 切换到某个会话\n" +
       "/current - 显示当前会话信息\n\n" +
+      "**小工管理**\n" +
+      "/agents - 查看所有在线小工\n\n" +
       "**设备管理**\n" +
       "/device - 查看当前设备信息\n\n" +
       "**其他**\n" +
@@ -502,13 +579,21 @@ export class FeishuCommands {
   }
 
   private async sendToFeishu(text: string): Promise<void> {
-    await this.deps.channelManager.broadcast({
-      type: "assistant",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text }],
-      },
-    } as any);
+    // 使用 effectiveChannel（支持劫持）
+    const channel = this.effectiveChannel;
+    if (channel) {
+      // 劫持模式下（群聊路由）自动加身份前缀
+      const finalText = (this.replyChannel && this.agentName)
+        ? `【${this.agentName}】\n${text}`
+        : text;
+      await channel.send({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: finalText }],
+        },
+      } as any);
+    }
   }
 
   /**
