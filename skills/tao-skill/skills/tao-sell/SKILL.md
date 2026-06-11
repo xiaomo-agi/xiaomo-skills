@@ -1,5 +1,6 @@
 ---
 name: tao-sell
+version: "1.0.0"
 description: |
   涛哥销售思维框架。用涛哥的销售思维帮你诊断销售问题、找到突破口。
   触发方式：/tao-sell、「怎么做销售」「怎么成交」「客户不买单」「怎么提高转化」
@@ -506,3 +507,5 @@ description: |
 
 - 用户用中文就用中文回复，用英文就用英文回复
 - 中文回复遵循《中文文案排版指北》
+
+<!-- xiaomo-skill-source: github.com/xiaomo-agi/xiaomo-skills -->

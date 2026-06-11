@@ -1,5 +1,6 @@
 ---
 name: tao
+version: "1.1.0"
 description: |
   涛哥创业助手中台。分析你的问题涉及哪些维度，自动调度对应的子 skill 并行诊断，然后综合输出。
   触发方式：/tao、「涛哥怎么看」「帮我看看」
@@ -34,7 +35,7 @@ description: |
 | `/tao-startup` | 选赛道、创业方向、商业模式 | ✅ 已上线 |
 | `/tao-network` | 人脉、社交、混圈、合作 | ✅ 已上线 |
 | `/tao-growth` | 个人成长、精力管理、时间管理 | ✅ 已上线 |
-| `/tao-ip` | 个人品牌、IP、人设、影响力 | 🔜 待建 |
+| `/tao-ip` | 个人品牌、IP、人设、影响力 | ✅ 已上线 |
 
 ---
 
@@ -211,3 +212,5 @@ description: |
 
 - 用户用中文就用中文回复，用英文就用英文回复
 - 中文回复遵循《中文文案排版指北》
+
+<!-- xiaomo-skill-source: github.com/xiaomo-agi/xiaomo-skills -->

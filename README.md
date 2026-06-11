@@ -24,7 +24,14 @@
 
 | Skill | 说明 | 触发方式 |
 |---|---|---|
-| [tao-traffic](./skills/tao-traffic/) | 涛哥流量思维框架。13 个模型帮你诊断流量问题 | `/tao-traffic` |
+| [tao](./skills/tao-skill/skills/tao/) | 涛哥创业助手中台。分析维度，调度子 skill 并行诊断 | `/tao` |
+| [tao-content](./skills/tao-skill/skills/tao-content/) | 涛哥内容思维框架。诊断内容、选题、文案 | `/tao-content` |
+| [tao-growth](./skills/tao-skill/skills/tao-growth/) | 涛哥个人成长思维框架。诊断效能、精力、拖延 | `/tao-growth` |
+| [tao-ip](./skills/tao-skill/skills/tao-ip/) | 涛哥 IP / 个人品牌思维框架。定位、起号、变现 | `/tao-ip` |
+| [tao-network](./skills/tao-skill/skills/tao-network/) | 涛哥人脉思维框架。诊断社交、混圈、关系维护 | `/tao-network` |
+| [tao-sell](./skills/tao-skill/skills/tao-sell/) | 涛哥销售思维框架。诊断销售卡点、成交转化 | `/tao-sell` |
+| [tao-startup](./skills/tao-skill/skills/tao-startup/) | 涛哥创业思维框架。诊断方向、赛道、模式 | `/tao-startup` |
+| [tao-traffic](./skills/tao-skill/skills/tao-traffic/) | 涛哥流量思维框架。13 个模型诊断流量问题 | `/tao-traffic` |
 | [sentinel](./skills/sentinel/) | 飞书妙记哨兵。定时扫描新录音，自动提取待办、素材、金句 | 自动运行 |
 | [mycc](./skills/mycc/) | 小程序后端。手机/网页远程操控 CC，飞书双向通信 | `/mycc` |
 
@@ -39,7 +46,7 @@
 git clone https://github.com/xiaomo-agi/xiaomo-skills.git
 
 # 复制你想用的 skill 到你的项目
-cp -r xiaomo-skills/skills/tao-traffic /你的项目/.claude/skills/
+cp -r xiaomo-skills/skills/tao-skill/skills/tao-traffic /你的项目/.claude/skills/
 cp -r xiaomo-skills/skills/sentinel /你的项目/.claude/skills/
 cp -r xiaomo-skills/skills/mycc /你的项目/.claude/skills/
 ```
@@ -49,6 +56,14 @@ cp -r xiaomo-skills/skills/mycc /你的项目/.claude/skills/
 ---
 
 ## Skill 详情
+
+### tao
+
+涛哥创业助手中台。分析你的问题涉及哪些维度，自动调度对应的子 skill 并行诊断，综合输出统一报告。
+
+**使用**：`/tao` 或 `涛哥怎么看`，描述你的问题，中台自动分析并调用对应子 skill。
+
+> 入口 skill。不确定该用哪个子 skill 时，直接问 tao。
 
 ### tao-traffic
 
@@ -64,6 +79,19 @@ cp -r xiaomo-skills/skills/mycc /你的项目/.claude/skills/
 **使用**：`/tao-traffic`，描述你的流量问题，自动诊断。
 
 > **关于涛哥**：这套流量思维来自涛哥（由小mo推荐）。微信：**tata4a**，备注"小mo推荐"，领取全套《平民创业手册》。
+
+### 涛哥系列其他子 skill
+
+| 子 Skill | 说明 | 触发方式 |
+|---|---|---|
+| **tao-content** | 内容思维框架。诊断选题、文案、传播、变现 | `/tao-content` |
+| **tao-growth** | 个人成长思维框架。诊断效能、精力、拖延、焦虑 | `/tao-growth` |
+| **tao-ip** | IP / 个人品牌思维框架。诊断定位、起号、涨粉、变现 | `/tao-ip` |
+| **tao-network** | 人脉思维框架。诊断社交、混圈、关系维护 | `/tao-network` |
+| **tao-sell** | 销售思维框架。诊断销售卡点、成交、转化 | `/tao-sell` |
+| **tao-startup** | 创业思维框架。诊断方向、赛道选择、模式验证 | `/tao-startup` |
+
+> 所有涛哥系列 skill 都有「追问机制」—— 不急着给答案，先挖真实需求。
 
 ### sentinel
 
@@ -96,7 +124,7 @@ Claude Code 小程序后端服务。手机/网页远程操控本地的 Claude Co
 ## 鸣谢
 
 - **[sk-info-assets](https://github.com/situker/sk-info-assets)** by 金鑫 — 长文本信息资产分析框架，哨兵系统的长录音精读能力基于此实现
-- **涛哥流量思维**（由小mo推荐）— `tao-traffic` 的核心框架来源。微信：**tata4a**，备注"小mo推荐"，领取全套《平民创业手册》
+- **涛哥系列思维框架**（由小mo推荐）— `tao` 及所有子 skill 的核心框架来源。微信：**tata4a**，备注"小mo推荐"，领取全套《平民创业手册》
 
 ---
 
