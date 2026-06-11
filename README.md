@@ -1,136 +1,236 @@
-# xiaomo-skills（持续更新中）
+# xiaomo-skills
 
-哈喽啊，我是小mo，这里是我的开源 Skills 库。
+![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-v1.0-green?style=flat-square)
+![Claude-Skill](https://img.shields.io/badge/Claude-Skill-purple?style=flat-square)
+![Skills](https://img.shields.io/badge/Skills-11-orange?style=flat-square)
 
----
-
-## 小mo的自我介绍（20260526）
-
-【标签】00后 · 985数学系 · AI 编程 · 忠实涛粉 · 忠实吃货
-【经历】前众筹项目操盘，现任海外社媒运营
-【日常】AI 重度使用者，日均 5h+，致力于成为大众 V8（增肥计划）
-【全网同名】小mo的AI日记
-【如何链接】公众号🔍小mo的AI日记，请小mo吃饭，小mo什么都跟你说。
-【我的观点】
-学 AI 没有任何技巧，就是大量的用。用的足够多，就会发现哪个流程有问题，就会想优化、想迭代。
-
-这里致力于做一些提升用户幸福感，使用体验的 skill。尽量把事情变简单，比如一句话让 AI 帮你整理今日待办、纪要、思考。
-
-有很多想法还在实现中，我的审查速度还没跟上 AI 创造的速度，欢迎大家收藏 Star，skill 库会持续更新！
+> 小mo 的 Claude Skills 开源库。让 AI 帮你整理纪要、提取待办、分析内容、远程操控 Claude Code —— 一句话的事。
 
 ---
 
-## Skills
+## 👀 30 秒体验
+
+装完 sentinel 后，在飞书录一段 3 分钟的语音，60 秒内 AI 自动发来：
+
+```
+📡 哨兵扫描 15:32
+
+【待办】
+- [ ] 周四前把报价单发给客户 | 优先级：高 | deadline：周四
+
+【内容素材】
+> "时间是最贵的成本，犹豫的每一秒都在亏钱" — 适合：朋友圈
+
+【金句归档】
+> "先算账，再干活" — 涛哥直播，2026/06/11
+```
+
+—— 这就是「**录完语音，AI 自动帮你整理**」的感觉。
+
+---
+
+## 📑 目录
+
+- [这是什么](#这是什么)
+- [Skills 清单](#skills-清单)
+- [⚡ 一行安装](#-一行安装)
+- [能力范围](#能力范围)
+- [Skill 详情](#skill-详情)
+- [仓库结构](#仓库结构)
+- [鸣谢](#鸣谢)
+- [反馈 & Issue](#反馈--issue)
+- [关注我](#关注我)
+- [License](#license)
+
+---
+
+## 这是什么
+
+这是一个 **Claude Skills 集合**，解决日常高频痛点：
+
+| 痛点 | Skill | 解决方式 |
+|---|---|---|
+| 会议纪要听完就忘 | **sentinel** | 自动扫描飞书妙记，提取待办/素材/金句 |
+| 内容不知道怎么写 | **tao-content** | 涛哥内容思维框架，诊断选题+文案 |
+| 流量做不起来 | **tao-traffic** | 13 个模型诊断流量问题 |
+| 电脑不在身边想用 CC | **mycc** | 手机/网页远程操控 Claude Code |
+| 创业方向不确定 | **tao-startup** | 六层 OS 诊断方向问题 |
+
+**不是教程，是即装即用的工具**。每个 skill 复制到 `.claude/skills/` 就能用。
+
+> **注意**：部分 skill 依赖外部服务（如飞书 API），使用前请阅读各 skill 的 SETUP.md 配置前置条件。
+
+---
+
+## Skills 清单
+
+### 🔥 核心工具
+
+| Skill | 说明 | 触发方式 | 依赖 |
+|---|---|---|---|
+| [sentinel](./skills/sentinel/) | 飞书妙记哨兵。自动扫描新录音，提取待办/素材/金句 | 自动运行 / `sentinel` | lark-cli + 飞书应用 |
+| [sentinel-minimal](./skills/sentinel-minimal/) | 哨兵轻量版。零依赖，只扫描存档不通知 | `sentinel-minimal` | lark-cli |
+| [mycc](./skills/mycc/) | 小程序后端。手机/网页远程操控 CC | `/mycc` | Node.js + cloudflared |
+
+### 🧠 涛哥认知 OS（7 个）
 
 | Skill | 说明 | 触发方式 |
 |---|---|---|
-| [tao](./skills/tao-skill/skills/tao/) | 涛哥创业助手中台。分析维度，调度子 skill 并行诊断 | `/tao` |
-| [tao-content](./skills/tao-skill/skills/tao-content/) | 涛哥内容思维框架。诊断内容、选题、文案 | `/tao-content` |
-| [tao-growth](./skills/tao-skill/skills/tao-growth/) | 涛哥个人成长思维框架。诊断效能、精力、拖延 | `/tao-growth` |
-| [tao-ip](./skills/tao-skill/skills/tao-ip/) | 涛哥 IP / 个人品牌思维框架。定位、起号、变现 | `/tao-ip` |
-| [tao-network](./skills/tao-skill/skills/tao-network/) | 涛哥人脉思维框架。诊断社交、混圈、关系维护 | `/tao-network` |
-| [tao-sell](./skills/tao-skill/skills/tao-sell/) | 涛哥销售思维框架。诊断销售卡点、成交转化 | `/tao-sell` |
-| [tao-startup](./skills/tao-skill/skills/tao-startup/) | 涛哥创业思维框架。诊断方向、赛道、模式 | `/tao-startup` |
-| [tao-traffic](./skills/tao-skill/skills/tao-traffic/) | 涛哥流量思维框架。13 个模型诊断流量问题 | `/tao-traffic` |
-| [sentinel](./skills/sentinel/) | 飞书妙记哨兵。定时扫描新录音，自动提取待办、素材、金句 | 自动运行 |
-| [mycc](./skills/mycc/) | 小程序后端。手机/网页远程操控 CC，飞书双向通信 | `/mycc` |
+| [tao](./skills/tao-skill/skills/tao/) | 创业助手中台。自动调度子 skill 并行诊断 | `/tao` |
+| [tao-startup](./skills/tao-skill/skills/tao-startup/) | 创业思维框架。诊断方向/赛道/模式 | `/tao-startup` |
+| [tao-traffic](./skills/tao-skill/skills/tao-traffic/) | 流量思维框架。13 个模型诊断流量问题 | `/tao-traffic` |
+| [tao-content](./skills/tao-skill/skills/tao-content/) | 内容思维框架。诊断选题/文案/传播 | `/tao-content` |
+| [tao-sell](./skills/tao-skill/skills/tao-sell/) | 销售思维框架。诊断卡点/成交/转化 | `/tao-sell` |
+| [tao-growth](./skills/tao-skill/skills/tao-growth/) | 个人成长框架。诊断效能/精力/拖延 | `/tao-growth` |
+| [tao-ip](./skills/tao-skill/skills/tao-ip/) | IP 品牌框架。诊断定位/起号/变现 | `/tao-ip` |
+| [tao-network](./skills/tao-skill/skills/tao-network/) | 人脉思维框架。诊断社交/混圈/关系 | `/tao-network` |
 
-> 持续更新中。有新 Skill 会加进来，Star 一下不会错过。
+> 涛哥系列都有「追问机制」—— 不急着给答案，先挖真实需求。
 
 ---
 
-## 安装
+## ⚡ 一行安装
+
+**macOS / Linux：**
 
 ```bash
-# 克隆仓库
-git clone https://github.com/xiaomo-agi/xiaomo-skills.git
-
-# 复制你想用的 skill 到你的项目
-cp -r xiaomo-skills/skills/tao-skill/skills/tao-traffic /你的项目/.claude/skills/
-cp -r xiaomo-skills/skills/sentinel /你的项目/.claude/skills/
-cp -r xiaomo-skills/skills/mycc /你的项目/.claude/skills/
+git clone https://github.com/xiaomo-agi/xiaomo-skills.git /tmp/xiaomo-skills && \
+  cp -r /tmp/xiaomo-skills/skills/sentinel ~/.claude/skills/ && \
+  cp -r /tmp/xiaomo-skills/skills/tao-skill/skills/tao ~/.claude/skills/ && \
+  rm -rf /tmp/xiaomo-skills && echo "✅ 安装完成"
 ```
 
-每个 skill 文件夹里的 **SKILL.md** 是主文件，打开就知道怎么用。
+**Windows (PowerShell)：**
+
+```powershell
+git clone https://github.com/xiaomo-agi/xiaomo-skills.git $env:TEMP\xiaomo-skills
+Copy-Item -Recurse $env:TEMP\xiaomo-skills\skills\sentinel $env:USERPROFILE\.claude\skills\
+Copy-Item -Recurse $env:TEMP\xiaomo-skills\skills\tao-skill\skills\tao $env:USERPROFILE\.claude\skills\
+Remove-Item -Recurse -Force $env:TEMP\xiaomo-skills
+Write-Host "✅ 安装完成"
+```
+
+装完后，在 Claude Code 里说 **「哨兵」** 或 **`/tao`** 即可触发。
+
+---
+
+## 能力范围
+
+| | ✅ 擅长 | ❌ 不擅长 |
+|---|---|---|
+| **场景** | 飞书妙记整理 / 内容诊断 / 流量分析 / 创业方向 / 个人成长 / 销售转化 | 学术研究 / 医疗诊断 / 法律建议 / 纯技术架构 |
+| **输入** | 语音转录 / 会议纪要 / 长文本 / 用户问题描述 | 图片 / 视频 / 实时语音流 |
+| **输出** | 结构化待办 / 金句 / 内容素材 / 诊断报告 / 飞书通知 | 可执行代码 / 设计稿 / 视频剪辑 |
+| **风格** | 口语化、短句、直接给结论、追问机制 | 长篇论文 / 学术腔 / 鸡汤鼓励 |
 
 ---
 
 ## Skill 详情
 
-### tao
+### sentinel — 飞书妙记自动整理
 
-涛哥创业助手中台。分析你的问题涉及哪些维度，自动调度对应的子 skill 并行诊断，综合输出统一报告。
+每 60 分钟自动扫描飞书妙记新录音，分类处理：
 
-**使用**：`/tao` 或 `涛哥怎么看`，描述你的问题，中台自动分析并调用对应子 skill。
+- **短录音（< 5 分钟）** → 提取待办、内容素材、金句 → 飞书通知
+- **长录音（≥ 5 分钟）** → 逐字稿精读，提取方案/踩坑/商业信息/人脉 → 飞书通知
+- **低价值** → 静默归档
+
+**特点**：
+- 逐字稿优先（不是智能纪要），保留一手原话
+- 交叉验证：检查"有录音但无文档"的情况
+- 金句自动归档到本地文件
+- 状态持久化，不重复处理
+
+**前置条件**：lark-cli + 飞书自建应用（需 `minutes:app` 权限）+ tell-me skill
+
+> 不想配飞书通知？用 [sentinel-minimal](#sentinel-minimal--零依赖轻量版) 零依赖版。
+
+### sentinel-minimal — 零依赖轻量版
+
+sentinel 的精简版本：
+
+- ✅ 只扫描 + 本地存档（不通知、不同步第三方）
+- ✅ 只需要 lark-cli 一个外部工具
+- ✅ 文件默认保存到 skill 目录下的 `output/`
+- ✅ 可配置 `WORKSPACE_DIR` 自定义输出路径
+
+适合：不想折腾飞书应用、只需要本地存档的用户。
+
+### mycc — 小程序后端
+
+Claude Code 远程操控服务：
+
+- **Web 端**：手机/平板浏览器访问，随时随地用 CC
+- **飞书双向通信**：发消息到飞书 + 接收回复，支持文本/图片/文件
+- **流式卡片**：AI 回复实时更新到单张卡片
+- **Agent Teams**：多 Agent 协作
+
+**前置条件**：Node.js 18+、cloudflared（外网穿透）
+
+### tao — 涛哥创业助手中台
+
+分析你的问题涉及哪些维度，自动调度对应子 skill 并行诊断。
+
+**触发**：`/tao` 或「涛哥怎么看」，描述你的问题，中台自动分析并调用对应子 skill。
 
 > 入口 skill。不确定该用哪个子 skill 时，直接问 tao。
 
-### tao-traffic
+### 涛哥系列子 skill
 
-涛哥流量思维框架。帮你诊断流量问题，给出可执行的下一步。
+| 子 Skill | 核心能力 |
+|---|---|
+| **tao-traffic** | 13 个流量模型：占位思维、Match 法则、种子-钩子-筛子、下拉词三阶段... |
+| **tao-content** | 选题通过性测试、算账刺激、表达 DNA、诚实边界 |
+| **tao-sell** | 算账刺激、客户分类、成交路径、反对意见处理 |
+| **tao-startup** | 六层 OS 穿透、赛道选择、模式验证、MVP 设计 |
+| **tao-growth** | 精力管理、拖延诊断、目标设定、时间利用率 |
+| **tao-ip** | 定位公式、起号路径、内容矩阵、变现模式 |
+| **tao-network** | 人脉分层、混圈策略、关系维护、资源交换 |
 
-- 11 条核心信念（不可谈判的流量认知）
-- 13 个思维模型（占位思维、Match 法则、种子-钩子-筛子、下拉词三阶段、流量结构健康度、超级客户与路径设计、本地生活关键词公式、千川投放决策逻辑...）
-- 6 类信号诊断
-- 27 条决策启发式
-- 12 条反模式
-- 12 个真实案例
+**关于涛哥**：二十年连续创业者，公众号《屋里涛说》、知识星球《平民创业手册》、《确定性成长》作者。微信：**tata4a**，备注"小mo推荐"，领取全套《平民创业手册》。
 
-**使用**：`/tao-traffic`，描述你的流量问题，自动诊断。
+---
 
-> **关于涛哥**：这套流量思维来自涛哥（由小mo推荐）。微信：**tata4a**，备注"小mo推荐"，领取全套《平民创业手册》。
+## 仓库结构
 
-### 涛哥系列其他子 skill
-
-| 子 Skill | 说明 | 触发方式 |
-|---|---|---|
-| **tao-content** | 内容思维框架。诊断选题、文案、传播、变现 | `/tao-content` |
-| **tao-growth** | 个人成长思维框架。诊断效能、精力、拖延、焦虑 | `/tao-growth` |
-| **tao-ip** | IP / 个人品牌思维框架。诊断定位、起号、涨粉、变现 | `/tao-ip` |
-| **tao-network** | 人脉思维框架。诊断社交、混圈、关系维护 | `/tao-network` |
-| **tao-sell** | 销售思维框架。诊断销售卡点、成交、转化 | `/tao-sell` |
-| **tao-startup** | 创业思维框架。诊断方向、赛道选择、模式验证 | `/tao-startup` |
-
-> 所有涛哥系列 skill 都有「追问机制」—— 不急着给答案，先挖真实需求。
-
-### sentinel
-
-飞书妙记自动扫描工具。每 60 分钟扫一次新录音，分类处理：
-
-- 短录音（< 5 分钟）→ 提取待办、素材、金句
-- 长录音（>= 5 分钟）→ 完整信息资产分析
-- 流水账 → 自动入 flomo
-- 低价值 → 静默归档
-
-**依赖**：[lark-cli](https://github.com/webernfe/lark-cli) + 飞书授权
-
-### mycc
-
-Claude Code 小程序后端服务。手机/网页远程操控本地的 Claude Code。
-
-- **多通道输出**：Web（网页/小程序）+ 飞书，可同时启用
-- **飞书双向通信**：发消息到飞书 + 接收飞书消息回复，支持文本/图片/文件
-- **流式卡片**：AI 回复实时更新到单张卡片，替代逐条消息轰炸
-- **Agent Teams**：多 Agent 协作，一个后端管理多个项目
-- **文件收发**：支持在飞书收发 PDF/Word/Excel 等文件
-- **完整 API**：配对、聊天、历史记录、Skills 列表、SSE 实时广播
-
-**使用**：安装到 `.claude/skills/mycc/`，配置 `.env` 后 `/mycc` 启动后端。
-
-**依赖**：Node.js 18+，cloudflared（外网穿透）
+```
+xiaomo-skills/
+├── README.md                          # 本文件
+├── LICENSE                            # MIT
+└── skills/
+    ├── sentinel/                      # 飞书妙记哨兵（完整版）
+    │   ├── SKILL.md                   # 主入口
+    │   ├── rules.md                   # 核心规则 + 配置变量
+    │   ├── prompts.md                 # 执行流程
+    │   └── SETUP.md                   # 安装配置指南
+    ├── sentinel-minimal/              # 哨兵轻量版（零依赖）
+    │   ├── SKILL.md
+    │   ├── rules.md
+    │   ├── prompts.md
+    │   └── SETUP.md
+    ├── mycc/                          # 小程序后端
+    │   ├── SKILL.md
+    │   └── scripts/                   # 服务端代码
+    └── tao-skill/                     # 涛哥系列
+        └── skills/
+            ├── tao/                   # 中台入口
+            ├── tao-startup/
+            ├── tao-traffic/
+            ├── tao-content/
+            ├── tao-sell/
+            ├── tao-growth/
+            ├── tao-ip/
+            └── tao-network/
+```
 
 ---
 
 ## 鸣谢
 
-- **[sk-info-assets](https://github.com/situker/sk-info-assets)** by 金鑫 — 长文本信息资产分析框架，哨兵系统的长录音精读能力基于此实现
-- **涛哥系列思维框架**（由小mo推荐）— `tao` 及所有子 skill 的核心框架来源。微信：**tata4a**，备注"小mo推荐"，领取全套《平民创业手册》
-
----
-
-## 开发支持
-
-**GLM 5.1** · **Deepseek V4 pro** · **Kimi 2.6**
+- **[situk-yangtao-perspective](https://github.com/situker/situk-yangtao-perspective)** by 司徒K — README 排版参考
+- **[sk-info-assets](https://github.com/situker/sk-info-assets)** by 金鑫 — 长文本信息资产分析框架
+- **涛哥系列思维框架**（由小mo推荐）— `tao` 及所有子 skill 的核心框架来源
 
 ---
 
@@ -139,8 +239,7 @@ Claude Code 小程序后端服务。手机/网页远程操控本地的 Claude Co
 发现 bug、有功能建议、或者某个 Skill 不好用？直接开 Issue：
 
 1. 点仓库上方的 **Issues** → **New issue**
-2. 选对应模板（Bug report / Feature request）
-3. 尽量描述清楚：
+2. 描述清楚：
    - 你用的 Claude Code 版本
    - 触发方式（怎么复现）
    - 实际输出 vs 期望输出
@@ -162,3 +261,9 @@ Claude Code 小程序后端服务。手机/网页远程操控本地的 Claude Co
 ## License
 
 MIT — 随便用，注明出处就行。
+
+---
+
+> **作者**：小mo | **版本**：v1.0 | 持续更新中
+>
+> 有很多想法还在实现中，审查速度还没跟上 AI 创造的速度，欢迎大家收藏 Star ⭐
