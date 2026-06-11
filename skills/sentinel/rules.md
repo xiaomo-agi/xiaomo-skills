@@ -24,6 +24,8 @@
 - 长录音分析：`1-Inbox/YYYYMMDD_[{SENTINEL_NAME}]_<主题>.md`
 - 其他任何 `{SENTINEL_NAME}` 产生的文件：`<目录>/YYYYMMDD_[{SENTINEL_NAME}]_<描述>.<ext>`
 
+**目录不存在时自动创建**（写入文件前先 `mkdir -p <目录>`）。
+
 目的：用户让 AI 搜索 `[{SENTINEL_NAME}]` 即可一键定位所有 `{SENTINEL_NAME}` 相关文档。
 
 ---

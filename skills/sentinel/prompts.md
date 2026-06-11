@@ -144,7 +144,11 @@ Step B: 交叉验证（关键！）
 
 ## 金句存档
 > "原话" — 上下文
-写入文件：`3-Thinking/daily-quotes/YYYYMMDD_[{SENTINEL_NAME}]_金句.md`
+
+步骤：
+1. `mkdir -p 3-Thinking/daily-quotes/`（目录不存在则自动创建）
+2. 写入文件：`3-Thinking/daily-quotes/YYYYMMDD_[{SENTINEL_NAME}]_金句.md`
+
 （无金句则写"无"，不创建文件）
 ```
 
