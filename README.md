@@ -73,20 +73,22 @@
 | [sentinel-minimal](./skills/sentinel-minimal/) | 哨兵轻量版。零依赖，只扫描存档不通知 | `sentinel-minimal` | lark-cli |
 | [mycc](./skills/mycc/) | 小程序后端。手机/网页远程操控 CC | `/mycc` | Node.js + cloudflared |
 
-### 🧠 涛哥认知 OS（7 个）
+### 🧠 涛哥认知 OS（一套 8 个）
+
+一套完整的创业认知框架，由中台 + 7 个垂直子 skill 组成：
 
 | Skill | 说明 | 触发方式 |
 |---|---|---|
-| [tao](./skills/tao-skill/skills/tao/) | 创业助手中台。自动调度子 skill 并行诊断 | `/tao` |
-| [tao-startup](./skills/tao-skill/skills/tao-startup/) | 创业思维框架。诊断方向/赛道/模式 | `/tao-startup` |
-| [tao-traffic](./skills/tao-skill/skills/tao-traffic/) | 流量思维框架。13 个模型诊断流量问题 | `/tao-traffic` |
-| [tao-content](./skills/tao-skill/skills/tao-content/) | 内容思维框架。诊断选题/文案/传播 | `/tao-content` |
-| [tao-sell](./skills/tao-skill/skills/tao-sell/) | 销售思维框架。诊断卡点/成交/转化 | `/tao-sell` |
-| [tao-growth](./skills/tao-skill/skills/tao-growth/) | 个人成长框架。诊断效能/精力/拖延 | `/tao-growth` |
-| [tao-ip](./skills/tao-skill/skills/tao-ip/) | IP 品牌框架。诊断定位/起号/变现 | `/tao-ip` |
-| [tao-network](./skills/tao-skill/skills/tao-network/) | 人脉思维框架。诊断社交/混圈/关系 | `/tao-network` |
+| [tao](./skills/tao-skill/skills/tao/) | **中台入口**。分析维度，自动调度子 skill 并行诊断 | `/tao` |
+| [tao-startup](./skills/tao-skill/skills/tao-startup/) | 创业思维。诊断方向/赛道/模式 | `/tao-startup` |
+| [tao-traffic](./skills/tao-skill/skills/tao-traffic/) | 流量思维。13 个模型诊断流量问题 | `/tao-traffic` |
+| [tao-content](./skills/tao-skill/skills/tao-content/) | 内容思维。诊断选题/文案/传播 | `/tao-content` |
+| [tao-sell](./skills/tao-skill/skills/tao-sell/) | 销售思维。诊断卡点/成交/转化 | `/tao-sell` |
+| [tao-growth](./skills/tao-skill/skills/tao-growth/) | 个人成长。诊断效能/精力/拖延 | `/tao-growth` |
+| [tao-ip](./skills/tao-skill/skills/tao-ip/) | IP 品牌。诊断定位/起号/变现 | `/tao-ip` |
+| [tao-network](./skills/tao-skill/skills/tao-network/) | 人脉思维。诊断社交/混圈/关系 | `/tao-network` |
 
-> 涛哥系列都有「追问机制」—— 不急着给答案，先挖真实需求。
+> 入口用 `tao`，不确定该用哪个子 skill 时直接问它。所有子 skill 都有「追问机制」—— 不急着给答案，先挖真实需求。
 
 ---
 
@@ -168,15 +170,13 @@ Claude Code 远程操控服务：
 
 **前置条件**：Node.js 18+、cloudflared（外网穿透）
 
-### tao — 涛哥创业助手中台
+### tao — 涛哥认知 OS（一套 8 个）
 
-分析你的问题涉及哪些维度，自动调度对应子 skill 并行诊断。
+**中台**：`tao` 分析你的问题涉及哪些维度，自动调度对应子 skill 并行诊断，综合输出统一报告。
 
-**触发**：`/tao` 或「涛哥怎么看」，描述你的问题，中台自动分析并调用对应子 skill。
+**触发**：`/tao` 或「涛哥怎么看」，描述你的问题即可。
 
-> 入口 skill。不确定该用哪个子 skill 时，直接问 tao。
-
-### 涛哥系列子 skill
+**7 个垂直子 skill**：
 
 | 子 Skill | 核心能力 |
 |---|---|
@@ -229,7 +229,7 @@ xiaomo-skills/
 ## 鸣谢
 
 - **[situk-yangtao-perspective](https://github.com/situker/situk-yangtao-perspective)** by 司徒K — README 排版参考
-- **[sk-info-assets](https://github.com/situker/sk-info-assets)** by 金鑫 — 长文本信息资产分析框架
+- **[sk-info-assets](https://github.com/situker/sk-info-assets)** by 司徒K — 长文本信息资产分析框架
 - **涛哥系列思维框架**（由小mo推荐）— `tao` 及所有子 skill 的核心框架来源
 
 ---
@@ -252,7 +252,7 @@ xiaomo-skills/
 
 - **公众号**：小mo的AI日记（全网同名）
 - **GitHub**：[xiaomo-agi](https://github.com/xiaomo-agi)
-- **Twitter**：蓝V开通后补链接
+- **Twitter**：[@ChloeMo438858](https://x.com/ChloeMo438858)
 
 有问题？加好友备注"来自 GitHub"。
 
