@@ -38,7 +38,6 @@ Step A: 分类判断
 {items_table}
 
 分类规则：
-- 标题含"流水账/复盘/日常工作/日常" → 流水账
 - 时长 < 5 分钟 → 短录音
 - 时长 ≥ 5 分钟 → 长录音
 - 时长 < 15 秒，且内容为环境音/测试/无实质对话 → 低价值
@@ -58,7 +57,6 @@ Step B: 交叉验证（关键！）
 - ❌ 无智能纪要，无文字记录 → 必须走 vc +notes 逐字稿路径
 
 输出格式：
-- 流水账：<token> | <标题> | 文档状态 → flomo-journal
 - 短录音：<token> | <标题> | <时长> | 文档状态 → 短录音处理
 - 长录音：<token> | <标题> | <时长> | 文档状态 → 长录音处理
 - 低价值：<token> | <标题> | <时长> → 静默归档
@@ -146,8 +144,8 @@ Step B: 交叉验证（关键！）
 > "原话" — 上下文
 
 步骤：
-1. `mkdir -p 3-Thinking/daily-quotes/`（目录不存在则自动创建）
-2. 写入文件：`3-Thinking/daily-quotes/YYYYMMDD_[{SENTINEL_NAME}]_金句.md`
+1. `mkdir -p {WORKSPACE_DIR}/daily-quotes/`（目录不存在则自动创建）
+2. 写入文件：`{WORKSPACE_DIR}/daily-quotes/YYYYMMDD_[{SENTINEL_NAME}]_金句.md`
 
 （无金句则写"无"，不创建文件）
 ```
@@ -228,27 +226,7 @@ Step B: 交叉验证（关键！）
 
 ---
 
-## 6. 流水账处理
-
-```
-妙记 {token}（标题：{title}）为流水账类录音。
-
-⚠️ 不要尝试获取录音文件。直接搜索飞书文档：
-1. lark-cli docs +search --query "文字记录：{title关键词}" --as user --format pretty
-2. lark-cli docs +fetch --doc <doc_token> --as user --format pretty
-
-执行 flomo-journal 完整流程：
-1. 读取文字记录原话
-2. 查询 Bitable 当日工作记录
-3. 整合原话 + 工作记录
-4. 生成摘要，发飞书给用户确认
-5. 用户确认后发 flomo
-6. 更新 diary-sync-status.md
-```
-
----
-
-## 7. 发送飞书通知
+## 6. 发送飞书通知
 
 ```
 用 tell-me skill 发飞书卡片通知用户：
@@ -270,22 +248,22 @@ Step B: 交叉验证（关键！）
 
 ---
 
-## 8. 更新状态文件
+## 7. 更新状态文件
 
 ```
-更新 memory/minutes-sentinel-status.md：
+更新 status.md（skill 目录下）：
 
 1. last_checked 改为当前时间 {now}
 2. 已处理 token 追加到列表，格式：
    - <token> — <标题> (<日期时间>) ✅ (<备注>)
 
-3. 检查裁剪：超过 7 天的 token 移到 5-Archive/sentinel-history.md
+3. 检查裁剪：超过 14 天的 token 移到 {WORKSPACE_DIR}/archive/sentinel-history.md
 4. 检查失败队列：已成功的移除，失败的更新重试次数
 ```
 
 ---
 
-## 9. 自检（扫描结束前）
+## 8. 自检（扫描结束前）
 
 ```
 哨兵扫描自检（即 `{SENTINEL_NAME}` 自检）：

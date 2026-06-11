@@ -1,29 +1,113 @@
-# 妨记哨兵 — 新用户 Onboarding
+# 妙记哨兵 — 安装配置指南
 
-> 首次安装哨兵时，AI 自动执行以下步骤。用户只需确认默认配置即可开始使用。
+> 首次安装时，AI 自动执行以下步骤。用户只需确认默认配置即可开始使用。
 
 ---
 
-## 安装检查流程
+## 前置条件（必须）
 
-### Step 1: 检测环境
+安装前请确保以下工具已就绪：
+
+| 工具 | 用途 | 安装命令 |
+|---|---|---|
+| lark-cli | 读取飞书妙记、文档 | `npm install -g @larksuiteoapi/lark-cli` |
+| tell-me skill | 飞书通知 | 见下方配置 |
+
+### 1. 配置 lark-cli
+
+```bash
+# 登录飞书
+lark-cli auth login
+
+# 验证登录状态
+lark-cli auth whoami
+```
+
+### 2. 创建飞书自建应用（获取 API 权限）
+
+飞书妙记需要自建应用才能访问，步骤如下：
+
+**Step 1: 创建应用**
+1. 打开 [飞书开发者平台](https://open.feishu.cn/app)
+2. 点击「创建企业自建应用」
+3. 填写应用名称（如"妙记哨兵"），选择「企业自建应用」
+4. 记录 **App ID** 和 **App Secret**
+
+**Step 2: 添加权限**
+在「权限管理」中添加以下权限：
+- `minutes:app` — 访问妙记
+- `im:chat:readonly` — 读取群信息
+- `im:message:send_as_bot` — 以机器人身份发消息
+- `docs:document:readonly` — 读取文档
+
+**Step 3: 发布应用**
+1. 「版本管理与发布」→「创建版本」
+2. 填写版本号（如 1.0.0）和更新说明
+3. 点击「申请发布」→「确认发布」
+4. **必须发布后才能调用 API**
+
+**Step 4: 配置 lark-cli 使用自建应用**
+
+```bash
+lark-cli auth login --app-id <你的AppID> --app-secret <你的AppSecret>
+```
+
+### 3. 配置 tell-me skill（飞书通知）
+
+sentinel 扫描到有价值的录音后，通过 tell-me 发飞书通知。
+
+tell-me 配置步骤：
+1. 在飞书群里添加你的自建应用机器人
+2. 记录群聊的 `chat_id`
+3. 配置 tell-me skill 的 `config.json`：
+
+```json
+{
+  "default_channel": "feishu",
+  "feishu": {
+    "chat_id": "你的群chat_id"
+  }
+}
+```
+
+获取 chat_id 的方法：
+```bash
+lark-cli im chat +list --as user --format json
+```
+
+---
+
+## 安装步骤
+
+### Step 1: 配置 WORKSPACE_DIR
+
+打开 `rules.md`，修改 `WORKSPACE_DIR`：
+
+```yaml
+WORKSPACE_DIR: ./output/   # 默认，相对 skill 目录
+# 或
+WORKSPACE_DIR: /Users/xxx/Documents/sentinel-output/  # 绝对路径
+```
+
+所有生成文件（金句、分析、状态）都会存到这个目录下。
+
+### Step 2: 初始化目录结构
+
+AI 自动创建以下目录：
 
 ```
-检测以下文件/目录是否存在：
-□ memory/minutes-sentinel-status.md（哨兵状态文件）
-□ 3-Thinking/daily-quotes/（金句归档目录）
-□ 5-Archive/sentinel-history.md（历史归档文件）
+{WORKSPACE_DIR}/
+├── daily-quotes/          # 金句存档
+├── inbox/                 # 长录音分析
+├── archive/               # 历史归档
+└── status.md              # 哨兵状态文件
 ```
 
-### Step 2: 自动创建缺失项
-
-如果检测到缺失，**不问用户，直接创建**：
-
-1. **状态文件不存在** → 创建 `memory/minutes-sentinel-status.md`，内容：
+**status.md 初始内容**：
 
 ```markdown
 ---
-name: minutes-sentinel-status
+name: sentinel-status
 description: 妙记哨兵状态跟踪
 metadata:
   type: project
@@ -33,7 +117,6 @@ metadata:
 
 - **last_checked**: <今天日期> 00:00
 - **purpose**: 每 60 分钟自动扫描飞书妙记新录音
-- **exclude**: 标题含"流水账/复盘/日常工作/日常"的录音归 flomo-journal 处理
 
 ## 已处理 token
 
@@ -51,24 +134,9 @@ metadata:
 
 ## 状态文件维护
 
-- **裁剪规则**：已处理 token 保留最近 7 天，超过的归档到 `5-Archive/sentinel-history.md`
+- **裁剪规则**：已处理 token 保留最近 14 天，超过的归档到 `{WORKSPACE_DIR}/archive/sentinel-history.md`
 - **失败队列**：重试上限 3 次，超过标记为 abandoned
 - **去重**：保留最早条目，删除重复 token
-
-## 获取转录的正确路径
-
-1. `lark-cli minutes minutes get --params '{"minute_token":"xxx"}' --as user` → 拿 note_id
-2. `lark-cli docs +search --query "文字记录：标题关键词" --as user --format pretty` → 拿 doc token
-3. `lark-cli docs +fetch --doc <token> --as user --format pretty` → 读内容
-```
-
-2. **daily-quotes 目录不存在** → 创建 `3-Thinking/daily-quotes/` 目录
-
-3. **归档文件不存在** → 创建 `5-Archive/sentinel-history.md`：
-```markdown
-# 哨兵历史归档
-
-> 存放超过 7 天的已处理 token 和超过重试上限的失败条目
 ```
 
 ### Step 3: 配置定时触发
@@ -82,7 +150,7 @@ metadata:
 在 `.claude/skills/scheduler/tasks.md` 的「间隔任务」中添加：
 
 ```
-| 每60分钟 | 妙记哨兵扫描 | - | 执行妙记哨兵完整流程（9步）... |
+| 每60分钟 | 妙记哨兵扫描 | - | 执行妙记哨兵完整流程（8步）... |
 ```
 
 **方案B：系统 cron / Task Scheduler（无 mycc 的用户）**
@@ -95,38 +163,49 @@ metadata:
 
 ---
 
-AI 安装时自动检测：
-1. 检查是否存在 `.claude/skills/scheduler/tasks.md` → 选方案A
-2. 不存在 → 提示用户选方案B或C，并给出配置示例
+## 安装完成确认
 
-### Step 4: 通知用户
-
-创建完成后，给用户一条简短提示：
+创建完成后，检查清单：
 
 ```
-✅ 妨记哨兵已就绪！
+✅ 妙记哨兵已就绪！
 
-已自动创建：
-- 📁 3-Thinking/daily-quotes/（金句归档）
-- 📄 memory/minutes-sentinel-status.md（状态跟踪）
-- ⏰ 每 60 分钟自动扫描新录音（通过 scheduler / cron / GitHub Actions）
+已配置：
+- 📁 {WORKSPACE_DIR}/daily-quotes/（金句归档）
+- 📁 {WORKSPACE_DIR}/inbox/（长录音分析）
+- 📄 {WORKSPACE_DIR}/status.md（状态跟踪）
+- ⏰ 每 60 分钟自动扫描新录音
 
 默认配置：
 - 扫描频率：每 60 分钟
-- 流水账录音 → 自动走 flomo-journal 流程
-- 短录音 → 提取待办/素材/金句
-- 长录音（≥5分钟）→ 完整信息资产分析
+- 短录音 → 提取待办/素材/金句 → 飞书通知
+- 长录音（≥5分钟）→ 逐字稿精读 → 飞书通知
+- 低价值 → 静默归档
+
+可选增强：
+- sk-info-assets skill → 长录音 8 节信息资产深度分析
 
 需要调整频率或规则，随时跟我说。
 ```
 
 ---
 
-## 前置条件
+## 故障排查
 
-用户需要已安装：
-- `lark-cli`（飞书命令行工具）
-- 已配置飞书授权（`lark-cli auth login`）
-- `tell-me` skill（飞书通知）
+| 问题 | 原因 | 解决 |
+|---|---|---|
+| `lark-cli auth login` 失败 | 网络或账号问题 | 检查梯子，确认飞书账号有开发者权限 |
+| 搜索妙记返回空 | 权限未开通 | 确认自建应用已发布，且有 `minutes:app` 权限 |
+| tell-me 通知发不出去 | chat_id 错误或 bot 不在群里 | 检查 chat_id，确认 bot 已加入目标群 |
+| 逐字稿下载失败 | 录音无逐字稿 | 改用「文字记录」文档路径 |
+| 状态文件丢失 | WORKSPACE_DIR 被修改 | 检查 `rules.md` 中的 WORKSPACE_DIR 配置 |
 
-如果缺少前置条件，提示用户安装，不要静默跳过。
+---
+
+## 可选：sk-info-assets 增强
+
+如需长录音深度分析，可额外安装 sk-info-assets skill：
+
+1. 将 sk-info-assets skill 放入 `.claude/skills/` 目录
+2. sentinel 长录音处理时会自动调用
+3. 不安装也不影响基础功能

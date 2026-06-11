@@ -1,7 +1,7 @@
 # 妙记哨兵 — 核心规则
 
 > 平台无关的哨兵逻辑。CC 和 Codex 各自用适配层读取本文件执行。
-> 状态文件：`memory/minutes-sentinel-status.md`
+> 状态文件：`status.md`（skill 目录下）
 
 ---
 
@@ -10,6 +10,7 @@
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `SENTINEL_NAME` | 哨兵 | 本 skill 的显示名称。可自定义为"管家"、"助手"等。修改此处即可全局生效，无需改其他位置。 |
+| `WORKSPACE_DIR` | `./output/` | 输出文件根目录。相对路径（基于 skill 目录）或绝对路径均可。 |
 
 > **使用方式**：所有下文中的 `{SENTINEL_NAME}` 均引用上表的值。
 > CC / Codex 执行时读取此变量，替换到输出文本、文件名标记、通知消息中。
@@ -20,9 +21,9 @@
 
 **所有 `{SENTINEL_NAME}` 生成的文件，文件名必须包含 `[{SENTINEL_NAME}]` 标记。**
 
-- 金句存档：`3-Thinking/daily-quotes/YYYYMMDD_[{SENTINEL_NAME}]_金句.md`
-- 长录音分析：`1-Inbox/YYYYMMDD_[{SENTINEL_NAME}]_<主题>.md`
-- 其他任何 `{SENTINEL_NAME}` 产生的文件：`<目录>/YYYYMMDD_[{SENTINEL_NAME}]_<描述>.<ext>`
+- 金句存档：`{WORKSPACE_DIR}/daily-quotes/YYYYMMDD_[{SENTINEL_NAME}]_金句.md`
+- 长录音分析：`{WORKSPACE_DIR}/inbox/YYYYMMDD_[{SENTINEL_NAME}]_<主题>.md`
+- 其他任何 `{SENTINEL_NAME}` 产生的文件：`{WORKSPACE_DIR}/<子目录>/YYYYMMDD_[{SENTINEL_NAME}]_<描述>.<ext>`
 
 **目录不存在时自动创建**（写入文件前先 `mkdir -p <目录>`）。
 
@@ -65,7 +66,6 @@
 ### 排除规则
 1. 已在"已处理 token"列表中的 → 跳过
 2. 已清除标题的录音 → 跳过
-3. 标题含"流水账/复盘/日常工作/日常" → 归 flomo-journal 处理，不在此流程
 
 ---
 
@@ -73,8 +73,7 @@
 
 | 类别 | 判断条件 | 处理方式 |
 |---|---|---|
-| 流水账 | 标题含"流水账/复盘/日常工作/日常" | flomo-journal skill（原话 + Bitable → 飞书确认 → flomo） |
-| 短录音 | 时长 < 5 分钟，非流水账 | 读逐字稿（或智能纪要）→ 提取待办/素材/金句 |
+| 短录音 | 时长 < 5 分钟 | 读逐字稿（或智能纪要）→ 提取待办/素材/金句 |
 | 长录音 | 时长 ≥ 5 分钟，课程/访谈/播客类 | 逐字稿精读 → 提取待办/素材/金句/人脉/踩坑/方案 |
 | 低价值 | 时长 < 15 秒，且内容明显为环境音/测试/重复道歉 | 标记为"低价值"，存档不通知 |
 
@@ -99,7 +98,7 @@
 - **适用渠道**：朋友圈 / 视频号 / 公众号 / 推特 / 小红书
 
 ### 3. 金句存档
-- 候选金句 → `3-Thinking/daily-quotes/YYYYMMDD_[{SENTINEL_NAME}]_金句.md`
+- 候选金句 → `{WORKSPACE_DIR}/daily-quotes/YYYYMMDD_[{SENTINEL_NAME}]_金句.md`
 - 格式：`> "原话" — 上下文说明`
 - **必须从逐字稿（说话人原话）提取**，禁止只从智能纪要提取
 
@@ -204,7 +203,7 @@ lark-cli vc +notes --minute-tokens "<token1>,<token2>,..." --as user --format pr
 - 没有新内容 → 静默，不通知
 - 短录音有高价值待办/优质素材 → `tell-me` 飞书通知
 - 长录音处理完成 → 通知分析结果摘要
-- 流水账 → 确认后再发 flomo
+- 所有低价值录音 → 静默归档
 - 所有低价值录音 → 静默归档
 
 ---
@@ -223,7 +222,7 @@ lark-cli vc +notes --minute-tokens "<token1>,<token2>,..." --as user --format pr
 
 ### 裁剪规则
 - 已处理 token 保留最近 **14 天**（原为 7 天，防止误判导致丢失）
-- 每次扫描后检查：超过 14 天的条目 → 移到 `5-Archive/sentinel-history.md`
+- 每次扫描后检查：超过 14 天的条目 → 移到 `{WORKSPACE_DIR}/archive/sentinel-history.md`
 - 归档格式：`<原条目> — 归档于 <日期>`
 
 ### 失败队列
@@ -249,7 +248,7 @@ lark-cli vc +notes --minute-tokens "<token1>,<token2>,..." --as user --format pr
 处理录音：{processed_count} 条
   - 短录音：{short_count} 条
   - 长录音：{long_count} 条
-  - 流水账：{journal_count} 条
+  - 低价值：{low_value_count} 条
   - 低价值：{low_value_count} 条
 
 提取成果：
