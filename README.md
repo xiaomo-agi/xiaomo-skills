@@ -166,7 +166,7 @@ Claude Code 远程操控服务：
 - **流式卡片**：AI 回复实时更新到单张卡片
 - **Agent Teams**：多 Agent 协作
 
-**前置条件**：Node.js 18+、cloudflared（外网穿透）
+**前置条件**：Node.js 18+、cloudflared（外网穿透），支持 Windows / macOS / Linux
 
 ### tao — 涛哥认知 OS（一套 8 个）
 

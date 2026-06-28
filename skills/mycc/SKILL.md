@@ -21,10 +21,8 @@ origin: P08-cc小程序，mycc 后端服务管理需求
 |------|------|
 | Claude Code | **必须是官方原版**，fork 版本可能不兼容 |
 | 网络 | 内网模式需要 VPN/代理（cloudflared 需访问外网）；公网模式（有 PUBLIC_URL）无需 |
-| 系统 | ✅ macOS、✅ Linux、❌ Windows、⚠️ WSL（不稳定） |
+| 系统 | ✅ macOS、✅ Linux、✅ Windows |
 
-> ⚠️ **Windows/WSL 用户注意**：目前 Windows 原生和 WSL 环境都存在兼容性问题，建议使用 macOS 或 Linux。
->
 > 💡 **关于第三方 Claude Code**：目前仅测试了官方原版，第三方 fork 版本的兼容性支持在规划中。
 
 ## 依赖
@@ -48,11 +46,21 @@ cd .claude/skills/mycc/scripts && npm install && cd -
 
 ### 2. 启动后端
 
+**macOS / Linux：**
+
 ```bash
 echo "=== $(date) ===" >> .claude/skills/mycc/mycc.log && nohup .claude/skills/mycc/scripts/node_modules/.bin/tsx .claude/skills/mycc/scripts/src/index.ts start >> .claude/skills/mycc/mycc.log 2>&1 & disown
 ```
 
 用 `nohup ... & disown` 让后端完全脱离 CC 进程树，关掉 CC 窗口也不会挂。**不要用 `run_in_background: true`**。日志实时写入 `.claude/skills/mycc/mycc.log`。
+
+**Windows：**
+
+```bash
+cd ".claude/skills/mycc/scripts" && node --experimental-vm-modules node_modules/tsx/dist/cli.mjs src/index.ts start
+```
+
+Windows 下在新终端窗口执行即可；关闭该终端会停止服务。该命令已在 Windows 11 + Git Bash 环境验证。
 
 > 代码会自动检测项目根目录（向上查找 `.claude/` 或 `claude.md`），无需手动指定 cwd。
 
@@ -91,7 +99,9 @@ grep CHANNEL_WEB .env 2>/dev/null || echo "CHANNEL_WEB=true"
 - **后台运行**：后端会在后台持续运行，不阻塞当前会话
 - **自动检测 cwd**：会向上查找项目根目录，确保 hooks 能正确加载
 - **连接信息**：保存在 `.claude/skills/mycc/current.json`
-- **停止服务**：`lsof -i :18080 -t -sTCP:LISTEN | xargs kill`
+- **停止服务**
+  - macOS / Linux：`lsof -i :18080 -t -sTCP:LISTEN | xargs kill`
+  - Windows：先 `netstat -ano | findstr :18080` 查 PID，再 `taskkill /PID <pid> /F`
 - **Agent Teams 支持**：后端已完整支持 Agent Teams（建队、派成员、通信、关队），CLI 2.1.63+ 原生支持，settingSources patch 仍需保留
 - **改代码后必须重启**：tsx 不热更新，修改 `scripts/src/` 下的代码后必须 kill + 重新启动后端，否则跑的还是旧代码
 
@@ -103,7 +113,9 @@ grep CHANNEL_WEB .env 2>/dev/null || echo "CHANNEL_WEB=true"
 3. 修复问题并重试
 
 常见问题：
-- **端口被占用**：`lsof -i :18080 -t -sTCP:LISTEN | xargs kill`
+- **端口被占用**
+  - macOS / Linux：`lsof -i :18080 -t -sTCP:LISTEN | xargs kill`
+  - Windows：`netstat -ano | findstr :18080` 查 PID，再 `taskkill /PID <pid> /F`
 - **cloudflared 未安装**：按上面的依赖说明安装
 - **tunnel 启动失败**：检查网络，重试即可
 
