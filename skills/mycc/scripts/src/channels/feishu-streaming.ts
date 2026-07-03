@@ -89,18 +89,106 @@ export function normalizeFeishuMarkdownLinks(text: string): string {
     .join("");
 }
 
+// ==================== 卡片超长截断 ====================
+
+// 飞书卡片整体上限约 30KB（按 JSON 序列化后算），预留结构字段开销取 28KB
+export const FEISHU_CARD_MAX_BYTES = 28 * 1024;
+
+const CARD_TRUNCATE_NOTICE =
+  "\n\n---\n⚠️ **内容过长，卡片已截断**。可以让我把完整内容写入文件，或分段重发。";
+
+// 卡片内容最终以 JSON 字符串发送，字节数要按转义后算（换行/引号都会翻倍）
+function jsonByteLength(text: string): number {
+  return Buffer.byteLength(JSON.stringify(text), "utf8");
+}
+
+/**
+ * 把文本截断到飞书卡片能承载的大小。
+ * 超限时优先在换行处断开，不拆散 emoji 代理对，补全未闭合的代码块围栏，
+ * 并在结尾追加截断提示——替代之前超限静默 400 吞掉整条回复的行为。
+ */
+export function truncateForFeishuCard(
+  text: string,
+  maxBytes = FEISHU_CARD_MAX_BYTES
+): { text: string; truncated: boolean } {
+  if (jsonByteLength(text) <= maxBytes) return { text, truncated: false };
+
+  const budget = maxBytes - jsonByteLength(CARD_TRUNCATE_NOTICE) - jsonByteLength("\n```");
+  // 二分找满足字节预算的最大字符前缀
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (jsonByteLength(text.slice(0, mid)) <= budget) lo = mid;
+    else hi = mid - 1;
+  }
+  let cut = lo;
+  const tail = text.charCodeAt(cut - 1);
+  if (tail >= 0xd800 && tail <= 0xdbff) cut -= 1;
+  const nl = text.lastIndexOf("\n", cut);
+  if (nl > 0 && cut - nl <= 300) cut = nl;
+
+  let head = text.slice(0, cut);
+  const fences = head.match(/```/g)?.length ?? 0;
+  if (fences % 2 === 1) head += "\n```";
+  return { text: head + CARD_TRUNCATE_NOTICE, truncated: true };
+}
+
+// ==================== 卡片翻页切分 ====================
+
+// 翻页标记：上一张卡片尾部 / 续卡开头（都占卡片字节预算）
+const CARD_CONT_TAIL = "\n\n---\n⬇️ **内容较长，接下一张卡片**";
+const CARD_CONT_HEAD = "⬆️ *接上一张卡片*\n\n";
+
+/**
+ * 为卡片翻页切分文本：找出当前卡片能装下的最大前缀。
+ * 与 truncateForFeishuCard 同源的切分规则（换行优先、不拆代理对、补代码围栏），
+ * 区别是剩余部分不丢弃——由调用方放进下一张卡片继续显示。
+ * headSuffix/restPrefix 用于跨卡片保持代码块围栏闭合。
+ */
+export function splitForCardRollover(
+  text: string,
+  maxBytes = FEISHU_CARD_MAX_BYTES,
+  prefixBytes = 0
+): { cut: number; headSuffix: string; restPrefix: string } {
+  const budget =
+    maxBytes - prefixBytes - jsonByteLength(CARD_CONT_TAIL) - jsonByteLength("\n```");
+  if (budget <= 0) return { cut: 0, headSuffix: "", restPrefix: "" };
+
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (jsonByteLength(text.slice(0, mid)) <= budget) lo = mid;
+    else hi = mid - 1;
+  }
+  let cut = lo;
+  const tail = text.charCodeAt(cut - 1);
+  if (tail >= 0xd800 && tail <= 0xdbff) cut -= 1;
+  const nl = text.lastIndexOf("\n", cut);
+  if (nl > 0 && cut - nl <= 300) cut = nl;
+  if (cut <= 0) return { cut: 0, headSuffix: "", restPrefix: "" };
+
+  const fences = text.slice(0, cut).match(/```/g)?.length ?? 0;
+  if (fences % 2 === 1) {
+    return { cut, headSuffix: "\n```", restPrefix: "```\n" };
+  }
+  return { cut, headSuffix: "", restPrefix: "" };
+}
+
 // ==================== buildMarkdownCard ====================
 
 /**
  * 构建飞书 schema 2.0 markdown 卡片
  * 完整支持代码块、表格、链接、加粗等 markdown 语法
+ * 超长内容在这里统一截断（sendMarkdownCardMessage / sendMarkdownReply 都走这个入口）
  */
 export function buildMarkdownCard(text: string): Record<string, unknown> {
   return {
     schema: "2.0",
     config: { wide_screen_mode: true },
     body: {
-      elements: [{ tag: "markdown", content: text }],
+      elements: [{ tag: "markdown", content: truncateForFeishuCard(text).text }],
     },
   };
 }
@@ -110,7 +198,12 @@ export function buildMarkdownCard(text: string): Record<string, unknown> {
 const API_BASE = "https://open.feishu.cn/open-apis";
 
 type Credentials = { appId: string; appSecret: string };
-type CardState = { cardId: string; messageId: string; sequence: number; currentText: string };
+type CardState = { cardId: string; messageId: string; sequence: number };
+type CardTarget = {
+  receiveId: string;
+  receiveIdType: "open_id" | "user_id" | "union_id" | "email" | "chat_id";
+  replyToMessageId?: string;
+};
 
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 
@@ -121,7 +214,7 @@ async function getFeishuToken(creds: Credentials): Promise<string> {
 
   const res = await fetch(`${API_BASE}/auth/v3/tenant_access_token/internal`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify({ app_id: creds.appId, app_secret: creds.appSecret }),
   });
   const data = (await res.json()) as {
@@ -144,25 +237,21 @@ function truncateSummary(text: string, max = 50): string {
   return clean.length <= max ? clean : clean.slice(0, max - 3) + "...";
 }
 
-function mergeStreamingText(
-  prev: string | undefined,
-  next: string | undefined
-): string {
-  const p = typeof prev === "string" ? prev : "";
-  const n = typeof next === "string" ? next : "";
-  if (!n) return p;
-  if (!p || n === p || n.includes(p)) return n;
-  if (p.includes(n)) return p;
-  return p + n;
-}
-
 /**
  * 飞书流式卡片会话
  *
  * 用法：
  * 1. session.start(receiveId, receiveIdType, replyToMessageId?)
- * 2. session.update(text)  // 随文本增长调用
+ * 2. session.update(text)  // 传"到目前为止的全量文本快照"，后写覆盖
  * 3. session.close(finalText?)
+ *
+ * update/close 的入参一律是全量快照：按事件类型累积文本是调用方的职责
+ * （feishu.ts / feishu-commands.ts 都各自维护累积文本）。这里不做
+ * 增量/全量的启发式猜测——之前用 includes() 猜，新片段恰好是已有
+ * 文本子串时（如 AI 说了重复的话）会被当成旧内容静默丢掉。
+ *
+ * 内容超过单卡片上限（约 30KB）时自动翻页：当前卡片收尾并标注
+ * "接下一张卡片"，开一张新的流式卡片续写剩余内容——长回复不再被截断。
  *
  * 如果 CardKit API 不可用（权限不足等），会抛出错误，
  * 调用方应降级到普通消息发送。
@@ -170,12 +259,22 @@ function mergeStreamingText(
 export class FeishuStreamingSession {
   private creds: Credentials;
   private state: CardState | null = null;
+  private target: CardTarget | null = null;
   private queue: Promise<void> = Promise.resolve();
   private closed = false;
   private lastUpdateTime = 0;
   private pendingText: string | null = null;
   private readonly updateThrottleMs = 100;
   private log?: (msg: string) => void;
+  // 最新的全量文本快照（跨卡片）；每张卡片只显示 baseOffset 之后的部分
+  private fullText = "";
+  // 已翻页进历史卡片的字符数
+  private baseOffset = 0;
+  // 当前卡片的显示前缀（"接上一张卡片" + 可能的代码围栏重开）
+  private contPrefix = "";
+  // 实际发到当前卡片上的文本（可能是截断版）
+  private lastDisplayedText = "";
+  private truncateLogged = false;
 
   constructor(creds: Credentials, log?: (msg: string) => void) {
     this.creds = creds;
@@ -188,7 +287,17 @@ export class FeishuStreamingSession {
     replyToMessageId?: string
   ): Promise<void> {
     if (this.state) return;
+    this.target = { receiveId, receiveIdType, replyToMessageId };
+    this.state = await this.createCard();
+    this.log?.(
+      `[Streaming] 已启动: cardId=${this.state.cardId}, messageId=${this.state.messageId}`
+    );
+  }
 
+  /** 创建一张流式卡片并发送到目标（start 和翻页共用） */
+  private async createCard(): Promise<CardState> {
+    if (!this.target) throw new Error("createCard called before start");
+    const { receiveId, receiveIdType, replyToMessageId } = this.target;
     const token = await getFeishuToken(this.creds);
 
     // 创建流式卡片（streaming_mode: true）
@@ -211,7 +320,7 @@ export class FeishuStreamingSession {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
       },
       body: JSON.stringify({ type: "card_json", data: JSON.stringify(cardJson) }),
     });
@@ -240,7 +349,7 @@ export class FeishuStreamingSession {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
       },
       body: JSON.stringify(sendBody),
     });
@@ -255,54 +364,213 @@ export class FeishuStreamingSession {
       );
     }
 
-    this.state = {
-      cardId,
-      messageId: sendData.data.message_id,
-      sequence: 1,
-      currentText: "",
-    };
-    this.log?.(`[Streaming] 已启动: cardId=${cardId}, messageId=${sendData.data.message_id}`);
+    return { cardId, messageId: sendData.data.message_id, sequence: 1 };
   }
 
   async update(text: string): Promise<void> {
     if (!this.state || this.closed) return;
-    const merged = mergeStreamingText(
-      this.pendingText ?? this.state.currentText,
-      text
-    );
-    if (!merged || merged === this.state.currentText) return;
+    if (!text || text === this.fullText) return;
+    // 记为待发快照；节流窗口内的多次调用只保留最新一份
+    this.pendingText = text;
 
     const now = Date.now();
-    if (now - this.lastUpdateTime < this.updateThrottleMs) {
-      this.pendingText = merged;
-      return;
-    }
-    this.pendingText = null;
+    if (now - this.lastUpdateTime < this.updateThrottleMs) return;
     this.lastUpdateTime = now;
 
     this.queue = this.queue.then(async () => {
       if (!this.state || this.closed) return;
-      const mergedText = mergeStreamingText(this.state.currentText, merged);
-      if (!mergedText || mergedText === this.state.currentText) return;
-      this.state.currentText = mergedText;
-      this.state.sequence += 1;
-      await fetch(
+      const snapshot = this.pendingText;
+      if (!snapshot || snapshot === this.fullText) return;
+      this.pendingText = null;
+      this.fullText = snapshot;
+      await this.syncContent(snapshot, "更新");
+    });
+    await this.queue;
+  }
+
+  /**
+   * 把全量快照同步到卡片：当前卡片装得下就 PUT，装不下就翻页——
+   * 收尾当前卡片（尾部标注"接下一张卡片"）、开新卡片续写，循环直到装下。
+   * 翻页失败（建新卡报错等）回退为旧的截断行为，正文至少不静默丢失。
+   */
+  private async syncContent(fullText: string, action: string): Promise<void> {
+    // 单次同步最多翻这么多页，防御异常输入下的死循环（正常一次增量至多翻 1~2 页）
+    for (let page = 0; page < 50; page++) {
+      if (!this.state) return;
+      const display = this.contPrefix + fullText.slice(this.baseOffset);
+      if (jsonByteLength(display) <= FEISHU_CARD_MAX_BYTES) {
+        if (display === this.lastDisplayedText) return;
+        this.state.sequence += 1;
+        // 只有真正更新成功才记录已显示内容，否则收尾更新会误判"已是最新"而跳过
+        if (await this.putCardContent(display, action)) {
+          this.lastDisplayedText = display;
+        }
+        return;
+      }
+      if (!(await this.rolloverCard(fullText))) {
+        // 翻页失败：回退截断显示（与旧行为一致，尾部有提示不静默）
+        const { text: displayText } = truncateForFeishuCard(display);
+        if (!this.truncateLogged) {
+          this.truncateLogged = true;
+          this.log?.(
+            `[Streaming] 翻页不可用，内容截断显示（全量 ${fullText.length} 字符）: cardId=${this.state.cardId}`
+          );
+        }
+        if (displayText === this.lastDisplayedText) return;
+        this.state.sequence += 1;
+        if (await this.putCardContent(displayText, action)) {
+          this.lastDisplayedText = displayText;
+        }
+        return;
+      }
+    }
+    this.log?.(`[Streaming] ⚠ 翻页次数达到上限，停止本次同步`);
+  }
+
+  /** 卡片翻页：收尾当前卡片 → 开新卡片。成功返回 true 并把 state 指向新卡片 */
+  private async rolloverCard(fullText: string): Promise<boolean> {
+    if (!this.state || !this.target) return false;
+    const remaining = fullText.slice(this.baseOffset);
+    const { cut, headSuffix, restPrefix } = splitForCardRollover(
+      remaining,
+      FEISHU_CARD_MAX_BYTES,
+      jsonByteLength(this.contPrefix)
+    );
+    if (cut <= 0) return false;
+
+    // 先开好新卡片：建卡失败时当前卡片保持原样，走截断回退
+    let nextState: CardState;
+    try {
+      nextState = await this.createCard();
+    } catch (e) {
+      this.log?.(`[Streaming] 翻页建新卡失败: ${String(e)}`);
+      return false;
+    }
+
+    // 收尾当前卡片：定格本页内容 + 翻页标记，关闭流式模式
+    const headDisplay = this.contPrefix + remaining.slice(0, cut) + headSuffix + CARD_CONT_TAIL;
+    this.state.sequence += 1;
+    if (await this.putCardContent(headDisplay, "翻页收尾")) {
+      this.lastDisplayedText = headDisplay;
+    }
+    await this.patchStreamingSettings(this.state, {
+      streaming_mode: false,
+      summary: { content: truncateSummary(remaining.slice(0, cut)) },
+    });
+
+    this.baseOffset += cut;
+    this.contPrefix = CARD_CONT_HEAD + restPrefix;
+    this.state = nextState;
+    this.lastDisplayedText = "";
+    this.truncateLogged = false;
+    this.log?.(
+      `[Streaming] 已翻页到新卡片: cardId=${nextState.cardId}（已定格 ${this.baseOffset} 字符）`
+    );
+    return true;
+  }
+
+  /** PUT 卡片内容并检查业务码——失败要出现在日志里，不再静默吞掉。
+   *  飞书会在长回合无更新时自动关闭流式模式（300309），此时重开流式再重试一次。 */
+  private async putCardContent(content: string, action: string): Promise<boolean> {
+    if (!this.state) return false;
+    let data = await this.putContentOnce(content, action);
+    if (data?.code === 300309) {
+      this.log?.(`[Streaming] 流式模式已被服务端关闭，重开后重试: cardId=${this.state.cardId}`);
+      if (await this.reopenStreaming()) {
+        this.state.sequence += 1;
+        data = await this.putContentOnce(content, action);
+      }
+    }
+    if (!data) return false;
+    if (data.code !== 0) {
+      this.log?.(`[Streaming] ${action}失败 (code ${data.code}): ${data.msg}`);
+      return false;
+    }
+    return true;
+  }
+
+  private async putContentOnce(
+    content: string,
+    action: string
+  ): Promise<{ code?: number; msg?: string } | null> {
+    if (!this.state) return null;
+    try {
+      const res = await fetch(
         `${API_BASE}/cardkit/v1/cards/${this.state.cardId}/elements/content/content`,
         {
           method: "PUT",
           headers: {
             Authorization: `Bearer ${await getFeishuToken(this.creds)}`,
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
           },
           body: JSON.stringify({
-            content: mergedText,
+            content,
             sequence: this.state.sequence,
             uuid: `s_${this.state.cardId}_${this.state.sequence}`,
           }),
         }
-      ).catch((e) => this.log?.(`Update failed: ${String(e)}`));
-    });
-    await this.queue;
+      );
+      return (await res.json().catch(() => null)) as { code?: number; msg?: string } | null;
+    } catch (e) {
+      this.log?.(`[Streaming] ${action}失败: ${String(e)}`);
+      return null;
+    }
+  }
+
+  private async reopenStreaming(): Promise<boolean> {
+    if (!this.state) return false;
+    this.state.sequence += 1;
+    try {
+      const res = await fetch(`${API_BASE}/cardkit/v1/cards/${this.state.cardId}/settings`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${await getFeishuToken(this.creds)}`,
+          "Content-Type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify({
+          settings: JSON.stringify({ config: { streaming_mode: true } }),
+          sequence: this.state.sequence,
+          uuid: `r_${this.state.cardId}_${this.state.sequence}`,
+        }),
+      });
+      const data = (await res.json().catch(() => null)) as { code?: number; msg?: string } | null;
+      if (!data || data.code !== 0) {
+        this.log?.(`[Streaming] 重开流式失败 (code ${data?.code}): ${data?.msg}`);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      this.log?.(`[Streaming] 重开流式失败: ${String(e)}`);
+      return false;
+    }
+  }
+
+  /** PATCH 卡片 settings（翻页收尾和 close 共用），失败只记日志 */
+  private async patchStreamingSettings(
+    state: CardState,
+    config: Record<string, unknown>
+  ): Promise<void> {
+    state.sequence += 1;
+    try {
+      const res = await fetch(`${API_BASE}/cardkit/v1/cards/${state.cardId}/settings`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${await getFeishuToken(this.creds)}`,
+          "Content-Type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify({
+          settings: JSON.stringify({ config }),
+          sequence: state.sequence,
+          uuid: `c_${state.cardId}_${state.sequence}`,
+        }),
+      });
+      const data = (await res.json().catch(() => null)) as { code?: number; msg?: string } | null;
+      if (data && data.code !== 0) {
+        this.log?.(`[Streaming] settings 更新失败 (code ${data.code}): ${data.msg}`);
+      }
+    } catch (e) {
+      this.log?.(`[Streaming] settings 更新失败: ${String(e)}`);
+    }
   }
 
   async close(finalText?: string): Promise<void> {
@@ -310,56 +578,21 @@ export class FeishuStreamingSession {
     this.closed = true;
     await this.queue;
 
-    const pendingMerged = mergeStreamingText(
-      this.state.currentText,
-      this.pendingText ?? undefined
-    );
-    const text = finalText
-      ? mergeStreamingText(pendingMerged, finalText)
-      : pendingMerged;
-    const token = await getFeishuToken(this.creds);
+    // 快照优先级：显式收尾文本 > 节流窗口里没来得及发的最新快照 > 已发内容
+    const text = finalText || this.pendingText || this.fullText;
 
-    // 最终文本更新
-    if (text && text !== this.state.currentText) {
-      this.state.sequence += 1;
-      await fetch(
-        `${API_BASE}/cardkit/v1/cards/${this.state.cardId}/elements/content/content`,
-        {
-          method: "PUT",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            content: text,
-            sequence: this.state.sequence,
-            uuid: `s_${this.state.cardId}_${this.state.sequence}`,
-          }),
-        }
-      ).catch(() => {});
-      this.state.currentText = text;
+    // 最终文本同步（超长时同样走翻页，保证收尾不丢内容）
+    if (text) {
+      this.fullText = text;
+      await this.syncContent(text, "收尾更新");
     }
 
-    // 关闭流式模式
+    // 关闭最后一张卡片的流式模式
     const summary = text ? truncateSummary(text) : "";
-    this.state.sequence += 1;
-    await fetch(`${API_BASE}/cardkit/v1/cards/${this.state.cardId}/settings`, {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json; charset=utf-8",
-      },
-      body: JSON.stringify({
-        settings: JSON.stringify({
-          config: {
-            streaming_mode: false,
-            summary: { content: summary },
-          },
-        }),
-        sequence: this.state.sequence,
-        uuid: `c_${this.state.cardId}_${this.state.sequence}`,
-      }),
-    }).catch((e) => this.log?.(`Close failed: ${String(e)}`));
+    await this.patchStreamingSettings(this.state, {
+      streaming_mode: false,
+      summary: { content: summary },
+    });
 
     this.log?.(`[Streaming] 已完成: cardId=${this.state.cardId}`);
   }

@@ -49,6 +49,12 @@ export interface CCAdapter {
   getOrCreateSession(params: SessionParams): SDKSession;
 
   /**
+   * 打断指定 session 的当前回合（等价终端 Esc）：只停正在跑的任务，
+   * 会话本身保留，后续消息可以继续。返回是否找到了活跃目标并发出打断。
+   */
+  interruptSession(sessionId: string): Promise<boolean>;
+
+  /**
    * 关闭指定 session
    */
   closeSession(sessionId: string): void;

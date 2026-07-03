@@ -29,8 +29,8 @@ const { executable: CLAUDE_EXECUTABLE, cliPath: _systemCliPath } = detectClaudeC
 const _patchedPath = resolve(__dirname, "..", "..", "cli-patched.js");
 const CLAUDE_CLI_PATH = ensurePatchedCli(_systemCliPath, _patchedPath);
 
-/** v2 SDKSessionOptions 必须提供 model，这是默认值 */
-const DEFAULT_MODEL = "sonnet";
+/** v2 SDKSessionOptions 必须提供 model，没有 /model 持久化选择时落到这个默认值（用户 2026-07-02 要求默认用 fable5） */
+const DEFAULT_MODEL = "claude-fable-5";
 
 /** Session 超时时间：15 分钟无活动自动关闭 */
 const SESSION_TIMEOUT_MS = 15 * 60 * 1000;
@@ -47,7 +47,7 @@ const CLEANUP_INTERVAL_MS = 2 * 60 * 1000;
 /**
  * 构造 v2 SDKSessionOptions
  */
-function buildSessionOptions(model?: string) {
+function buildSessionOptions(model?: string, cwd?: string) {
   // 清除 CLAUDECODE 环境变量，避免子进程被误判为嵌套会话 (#16)
   const cleanEnv = { ...process.env };
   delete cleanEnv.CLAUDECODE;
@@ -60,6 +60,10 @@ function buildSessionOptions(model?: string) {
     pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
     permissionMode: "bypassPermissions",
     ...(!isRoot && { allowDangerouslySkipPermissions: true }),
+    // SDKSessionOptions.cwd 直接传给子进程 spawn，不依赖 process.cwd()（已验证：
+    // unstable_v2_createSession 内部同步 spawn 子进程，cwd 选项原样传入 child_process.spawn，
+    // 完全不读 process.cwd()）。用这个字段代替 process.chdir()，从根上消除并发竞态。
+    ...(cwd && { cwd }),
     env: {
       ...cleanEnv,
       CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
@@ -87,6 +91,9 @@ export class OfficialAdapter implements CCAdapter {
 
   /** 每个 session 最后活跃时间 */
   private lastActivity = new Map<string, number>();
+
+  /** 正在处理消息的 session 计数（>0 表示回合进行中，清理器必须跳过，防止长任务被中途杀死） */
+  private inFlight = new Map<string, number>();
 
   /** 超时清理定时器 */
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -123,33 +130,22 @@ export class OfficialAdapter implements CCAdapter {
       return this.sessions.get(sessionId)!;
     }
 
-    const options = buildSessionOptions(model);
-
-    // v2 SDKSessionOptions 没有 cwd 字段，子进程通过 process.cwd() 继承工作目录
-    // 必须在创建 session（spawn 子进程）前 chdir 到正确目录，否则 skills 等功能失效
-    const originalCwd = process.cwd();
-    const needsChdir = cwd && cwd !== originalCwd;
-    if (needsChdir) {
-      process.chdir(cwd);
-    }
+    // 通过 SDKSessionOptions.cwd 直接告诉 SDK 子进程该用哪个工作目录（见 buildSessionOptions
+    // 注释）。相比之前 process.chdir(cwd) → create → process.chdir(originalCwd) 的写法，
+    // 这里完全不touch进程级全局状态 process.cwd()，因此两个并发的 getOrCreateSession()
+    // 调用（不同 cwd）永远不会互相踩踏，也不存在"子进程晚于 chdir 恢复才真正 spawn"的窗口。
+    const options = buildSessionOptions(model, cwd);
 
     let session: SDKSession;
-    try {
-      if (sessionId) {
-        // 有 sessionId 但不在池中 → resumeSession（sessionId 立即可用）
-        session = unstable_v2_resumeSession(sessionId, options);
-        this.sessions.set(sessionId, session);
-        this.lastActivity.set(sessionId, Date.now());
-      } else {
-        // 全新对话 → createSession（sessionId 要等第一条消息后才可用）
-        session = unstable_v2_createSession(options);
-        // 不存池，等 chat() 中从 stream 拿到 sessionId 后再存
-      }
-    } finally {
-      // 恢复原始 cwd
-      if (needsChdir) {
-        process.chdir(originalCwd);
-      }
+    if (sessionId) {
+      // 有 sessionId 但不在池中 → resumeSession（sessionId 立即可用）
+      session = unstable_v2_resumeSession(sessionId, options);
+      this.sessions.set(sessionId, session);
+      this.lastActivity.set(sessionId, Date.now());
+    } else {
+      // 全新对话 → createSession（sessionId 要等第一条消息后才可用）
+      session = unstable_v2_createSession(options);
+      // 不存池，等 chat() 中从 stream 拿到 sessionId 后再存
     }
 
     return session;
@@ -162,6 +158,28 @@ export class OfficialAdapter implements CCAdapter {
     this.sessions.set(sessionId, session);
     this.lastActivity.set(sessionId, Date.now());
     this.lifecycleCallbacks?.onSessionCreate?.(sessionId);
+  }
+
+  /**
+   * 打断指定 session 的当前回合（等价终端 Esc）。
+   * 只停当前回合不关会话——session 留在池里，后续消息继续复用。
+   *
+   * SDKSession 类型没有暴露 interrupt；打断能力在 v2 session 内部的 query
+   * 字段上（Query.interrupt 控制请求，实测 sdk.mjs 里该字段是公开类属性）。
+   * SDK 升级可能挪走这个内部结构，所以运行时判空，拿不到就返回 false
+   * （命令层会提示"没找到正在运行的任务"），绝不让 /stop 抛 TypeError。
+   */
+  async interruptSession(sessionId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    const query = (session as unknown as { query?: { interrupt?: () => Promise<void> } }).query;
+    if (typeof query?.interrupt !== "function") {
+      console.warn(`[OfficialAdapter] session.query.interrupt 不可用（SDK 内部结构变化？），无法打断 ${sessionId}`);
+      return false;
+    }
+    await query.interrupt();
+    this.lastActivity.set(sessionId, Date.now());
+    return true;
   }
 
   /**
@@ -227,8 +245,8 @@ export class OfficialAdapter implements CCAdapter {
    * 1. 非多轮模式 → 第一轮结束即退出
    * 2. Teams + TeamDelete → 退出
    * 3. 后台 Task + 全部完成（pending 计数归零）→ 退出
-   * 4. 轮间超时（5 分钟无新消息）→ 退出
-   * 5. 总安全阀（30 分钟）→ 强制退出
+   * 4. 轮间超时（15 分钟无新消息）→ 退出
+   * 5. 总安全阀（60 分钟）→ 强制退出
    */
   async *chat(params: ChatParams): AsyncIterable<SSEEvent> {
     const { message, sessionId, images, model, cwd } = params;
@@ -240,23 +258,6 @@ export class OfficialAdapter implements CCAdapter {
     // 构造消息内容（纯文本或图文混合）
     const content = buildMessageContent(message, images);
 
-    // 根据内容类型选择 send 格式
-    if (typeof content === "string") {
-      await session.send(content);
-    } else {
-      // 图文混合消息：必须用 SDKUserMessage 格式
-      // 新会话时 session_id 用空字符串，CLI 会自动分配
-      const userMessage: SDKUserMessage = {
-        type: "user",
-        session_id: sessionId || "",
-        message: {
-          role: "user",
-          content: content as any,
-        },
-        parent_tool_use_id: null,
-      };
-      await session.send(userMessage);
-    }
 
     // === 多轮循环核心 ===
     let resolvedSessionId = sessionId;
@@ -267,7 +268,34 @@ export class OfficialAdapter implements CCAdapter {
     const startTime = Date.now();
     let isFirstTurn = true;
 
+    // 标记回合进行中：清理器不能杀正在干活的会话（无论回合跑多久）
+    let inFlightId: string | null = sessionId || null;
+    if (inFlightId) this.markInFlight(inFlightId, +1);
+    const noteResolved = (id: string) => {
+      resolvedSessionId = id;
+      if (!inFlightId) {
+        inFlightId = id;
+        this.markInFlight(id, +1);
+      }
+    };
+
     try {
+      // Send must be inside the try block so a dead pooled session is closed.
+      if (typeof content === "string") {
+        await session.send(content);
+      } else {
+        const userMessage: SDKUserMessage = {
+          type: "user",
+          session_id: sessionId || "",
+          message: {
+            role: "user",
+            content: content as any,
+          },
+          parent_tool_use_id: null,
+        };
+        await session.send(userMessage);
+      }
+
       while (true) {
         // 总安全阀
         if (Date.now() - startTime > MAX_DURATION_MS) {
@@ -278,7 +306,9 @@ export class OfficialAdapter implements CCAdapter {
         if (isFirstTurn) {
           // 第一轮：直接消费 stream
           for await (const sdkMessage of session.stream()) {
-            this.extractSessionId(sdkMessage, resolvedSessionId, session, (id) => { resolvedSessionId = id; });
+            this.extractSessionId(sdkMessage, resolvedSessionId, session, noteResolved);
+            // 回合进行中也要刷新活跃时间，否则长回合会被 cleanupExpiredSessions 误杀
+            if (resolvedSessionId) this.lastActivity.set(resolvedSessionId, Date.now());
             const signals = detectMultiTurnSignals(sdkMessage);
             if (signals.teamsStarted) { isTeamsMode = true; isMultiTurnMode = true; }
             if (signals.teamsFinished) teamsFinished = true;
@@ -298,23 +328,32 @@ export class OfficialAdapter implements CCAdapter {
           const deadline = Date.now() + timeoutMs;
           let gotData = false;
           let firstIterResult: IteratorResult<unknown> | null = null;
+          // 跨心跳复用同一个 next() promise：async generator 的 next() 调用会排队消费，
+          // 每次心跳超时都重新调 next() 会把上一次"没人听"的 promise 永久遗弃在队列里，
+          // 下一条真实消息被那个弃单消费掉，表现为消息丢失
+          let pendingNext: Promise<IteratorResult<unknown>> | null = null;
 
           while (Date.now() < deadline) {
             const remaining = deadline - Date.now();
             const waitMs = Math.min(HEARTBEAT_INTERVAL_MS, remaining);
 
+            if (!pendingNext) pendingNext = streamGen.next();
+
             const raceResult = await Promise.race([
-              streamGen.next(),
+              pendingNext,
               sleep(waitMs).then(() => TIMEOUT_SENTINEL),
             ]);
 
             if (raceResult !== TIMEOUT_SENTINEL) {
               firstIterResult = raceResult as IteratorResult<unknown>;
               gotData = true;
+              pendingNext = null;
               break;
             }
 
-            // 超时片段到了但总超时未到 → 发心跳，继续等
+            // 超时片段到了但总超时未到 → 发心跳，继续等（pendingNext 保留，不重新拉取）
+            // 等待后台任务/Teams 期间同样刷新活跃时间，防止被清理器误杀
+            if (resolvedSessionId) this.lastActivity.set(resolvedSessionId, Date.now());
             yield { type: "heartbeat", ts: Date.now() } as SSEEvent;
           }
 
@@ -327,7 +366,8 @@ export class OfficialAdapter implements CCAdapter {
           if (done) break;
 
           // 处理首条消息
-          this.extractSessionId(value, resolvedSessionId, session, (id) => { resolvedSessionId = id; });
+          this.extractSessionId(value, resolvedSessionId, session, noteResolved);
+          if (resolvedSessionId) this.lastActivity.set(resolvedSessionId, Date.now());
           const firstSignals = detectMultiTurnSignals(value);
           if (firstSignals.teamsStarted) { isTeamsMode = true; isMultiTurnMode = true; }
           if (firstSignals.teamsFinished) teamsFinished = true;
@@ -337,7 +377,8 @@ export class OfficialAdapter implements CCAdapter {
 
           // 消费本轮剩余消息
           for await (const sdkMessage of streamGen) {
-            this.extractSessionId(sdkMessage, resolvedSessionId, session, (id) => { resolvedSessionId = id; });
+            this.extractSessionId(sdkMessage, resolvedSessionId, session, noteResolved);
+            if (resolvedSessionId) this.lastActivity.set(resolvedSessionId, Date.now());
             const signals = detectMultiTurnSignals(sdkMessage);
             if (signals.teamsStarted) { isTeamsMode = true; isMultiTurnMode = true; }
             if (signals.teamsFinished) teamsFinished = true;
@@ -374,11 +415,24 @@ export class OfficialAdapter implements CCAdapter {
 
       // 继续向上抛，让 HTTP handler 发送 SSE error 帧
       throw err;
+    } finally {
+      // 回合结束（无论正常/异常），释放"进行中"标记
+      if (inFlightId) this.markInFlight(inFlightId, -1);
     }
 
     // 最终更新活跃时间
     if (resolvedSessionId) {
       this.lastActivity.set(resolvedSessionId, Date.now());
+    }
+  }
+
+  /** 增减 session 的"回合进行中"计数 */
+  private markInFlight(sessionId: string, delta: number): void {
+    const next = (this.inFlight.get(sessionId) || 0) + delta;
+    if (next <= 0) {
+      this.inFlight.delete(sessionId);
+    } else {
+      this.inFlight.set(sessionId, next);
     }
   }
 
@@ -437,6 +491,12 @@ export class OfficialAdapter implements CCAdapter {
     const now = Date.now();
     for (const [id, lastTime] of this.lastActivity.entries()) {
       if (now - lastTime > SESSION_TIMEOUT_MS) {
+        // 回合进行中的会话不能杀：长任务跑几十分钟也不刷新 lastActivity，
+        // 之前这里会把干活中的会话 abort 掉，用户端表现为回复凭空消失
+        if ((this.inFlight.get(id) || 0) > 0) {
+          this.lastActivity.set(id, now);
+          continue;
+        }
         console.log(`[Session] 清理超时 session: ${id}`);
         this.closeSession(id);
       }
@@ -456,9 +516,13 @@ const TIMEOUT_SENTINEL = Symbol("TIMEOUT");
  * 检测多轮信号
  * - TeamCreate/TeamDelete：Agent Teams 生命周期
  * - Task + run_in_background：后台 subagent 启动
- * - task-notification + completed：后台 subagent 完成
+ * - task_notification + completed：后台 subagent 完成
+ *
+ * 只解析消息结构（tool_use block 的 name/input，system 消息的 subtype/status），
+ * 不对整条消息做字符串搜索——之前用 JSON.stringify(msg).includes(...) 会被正文里
+ * 讨论/引用这些字符串（比如贴 Workflow 脚本、讨论 mycc 自己代码）误触发
  */
-function detectMultiTurnSignals(msg: unknown): {
+export function detectMultiTurnSignals(msg: unknown): {
   teamsStarted: boolean;
   teamsFinished: boolean;
   bgTaskLaunched: boolean;
@@ -466,16 +530,30 @@ function detectMultiTurnSignals(msg: unknown): {
 } {
   const none = { teamsStarted: false, teamsFinished: false, bgTaskLaunched: false, bgTaskCompleted: false };
   if (!msg || typeof msg !== "object") return none;
+  const m = msg as Record<string, unknown>;
 
-  try {
-    const str = JSON.stringify(msg);
-    return {
-      teamsStarted: str.includes('"name":"TeamCreate"'),
-      teamsFinished: str.includes('"name":"TeamDelete"'),
-      bgTaskLaunched: str.includes('"name":"Task"') && str.includes('"run_in_background":true'),
-      bgTaskCompleted: str.includes("task-notification") && str.includes("completed"),
-    };
-  } catch {
-    return none;
+  if (m.type === "assistant") {
+    const content = (m.message as Record<string, unknown> | undefined)?.content;
+    if (Array.isArray(content)) {
+      let teamsStarted = false;
+      let teamsFinished = false;
+      let bgTaskLaunched = false;
+      for (const block of content) {
+        if (!block || typeof block !== "object" || (block as Record<string, unknown>).type !== "tool_use") continue;
+        const b = block as Record<string, unknown>;
+        if (b.name === "TeamCreate") teamsStarted = true;
+        if (b.name === "TeamDelete") teamsFinished = true;
+        if (b.name === "Task" && (b.input as Record<string, unknown> | undefined)?.run_in_background === true) {
+          bgTaskLaunched = true;
+        }
+      }
+      return { teamsStarted, teamsFinished, bgTaskLaunched, bgTaskCompleted: false };
+    }
   }
+
+  if (m.type === "system" && m.subtype === "task_notification" && m.status === "completed") {
+    return { ...none, bgTaskCompleted: true };
+  }
+
+  return none;
 }

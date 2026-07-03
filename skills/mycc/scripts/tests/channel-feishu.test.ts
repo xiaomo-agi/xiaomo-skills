@@ -45,6 +45,7 @@ describe("FeishuChannel", () => {
     receiveIdType: "open_id" as const,
     connectionMode: "poll" as const,
     showToolUse: true,
+    streamingCards: false,  // 静态卡片模式（流式卡片另有专项测试）
   };
 
   beforeEach(() => {
@@ -276,7 +277,8 @@ describe("FeishuChannel", () => {
       expect(sendCalls).toHaveLength(1);
     });
 
-    it("assistant 事件包含多个 text block 时逐条发送", async () => {
+    it("assistant 事件包含多个 text block 时合并发送", async () => {
+      channel = new FeishuChannel(validConfig);
       await channel.send({
         type: "assistant",
         message: {
@@ -290,11 +292,12 @@ describe("FeishuChannel", () => {
       const sendCalls = mockFetch.mock.calls.filter(
         (c: any[]) => typeof c[0] === "string" && c[0].includes("/im/v1/messages?")
       );
-      // 应发送 2 条消息（每个 text block 一条）
-      expect(sendCalls).toHaveLength(2);
+      // text block 合并为一条消息，不再逐条发送
+      expect(sendCalls).toHaveLength(1);
     });
 
-    it("assistant 事件包含 tool_use block（showToolUse=true）时发送", async () => {
+    it("assistant 事件包含 tool_use block（showToolUse=true）时合并发送", async () => {
+      channel = new FeishuChannel(validConfig);
       await channel.send({
         type: "assistant",
         message: {
@@ -308,8 +311,8 @@ describe("FeishuChannel", () => {
       const sendCalls = mockFetch.mock.calls.filter(
         (c: any[]) => typeof c[0] === "string" && c[0].includes("/im/v1/messages?")
       );
-      // text + tool_use = 2 条消息
-      expect(sendCalls).toHaveLength(2);
+      // text + tool_use 合并为一条消息
+      expect(sendCalls).toHaveLength(1);
     });
 
     it("assistant 事件 tool_use block（showToolUse=false）不发送工具调用", async () => {
@@ -454,9 +457,8 @@ describe("FeishuChannel", () => {
 
       await channel.start();
 
-      expect(mockFetch).toHaveBeenCalledTimes(1);
-      const url = mockFetch.mock.calls[0][0];
-      expect(url).toContain("tenant_access_token");
+      const tokenCalls = mockFetch.mock.calls.filter((call) => String(call[0]).includes("tenant_access_token"));
+      expect(tokenCalls).toHaveLength(1);
     });
 
     it("凭证无效时 start 不启动 WebSocket", async () => {
@@ -731,7 +733,7 @@ describe("FeishuChannel", () => {
         });
       });
 
-      channel = new FeishuChannel(validConfig);
+      channel = new FeishuChannel({ ...validConfig, streamingCards: false });
 
       // Step 1: system 事件带图片 → 上传并缓存 image_key
       await channel.send({
@@ -934,7 +936,8 @@ describe("FeishuChannel", () => {
       await channel.start();
 
       // token 获取成功
-      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const tokenCalls = mockFetch.mock.calls.filter((call) => String(call[0]).includes("tenant_access_token"));
+      expect(tokenCalls).toHaveLength(1);
       // WSClient 和 EventDispatcher 应该被创建
       expect(Lark.default.WSClient).toHaveBeenCalled();
       expect(Lark.default.EventDispatcher).toHaveBeenCalled();
@@ -1052,10 +1055,8 @@ describe("FeishuChannel", () => {
         });
       });
 
-      // 通过 addTypingIndicator 设置内部状态
-      // 由于 addTypingIndicator 是 private，我们通过反射访问
-      (channel as any).currentMessageId = "msg-123";
-      (channel as any).currentReactionId = "reaction-456";
+      // 通过反射设置内部状态（typingReactions 按 messageId 记录，支持多会话并发）
+      (channel as any).typingReactions.set("msg-123", "reaction-456");
 
       await channel.clearTypingIndicator();
 
@@ -1069,8 +1070,7 @@ describe("FeishuChannel", () => {
       expect(deleteCalls).toHaveLength(1);
 
       // 内部状态应该被清除
-      expect((channel as any).currentMessageId).toBeNull();
-      expect((channel as any).currentReactionId).toBeNull();
+      expect((channel as any).typingReactions.size).toBe(0);
     });
 
     it("text 事件含 Markdown 表格 → 走 schema 2.0 markdown 卡片路径", async () => {

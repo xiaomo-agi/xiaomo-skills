@@ -41,8 +41,14 @@ function stripSystemTags(text: string): string {
  * 自动检测项目根目录（查找 .claude/ 或 CLAUDE.md），确保历史记录路径一致性
  */
 export function encodeProjectPath(projectPath: string): string {
-  // 先找到项目根目录（统一逻辑，避免历史记录分散）
-  const root = findProjectRoot(projectPath) || projectPath;
+  // 如果是 .mycc-channels/ 子目录，直接使用该路径编码
+  // 确保每个通道有独立的历史记录目录
+  let root: string;
+  if (projectPath.includes(".mycc-channels")) {
+    root = projectPath;
+  } else {
+    root = findProjectRoot(projectPath) || projectPath;
+  }
 
   // 与 CC 官方编码逻辑对齐：只保留字母和数字，其他全部替换为 "-"
   return root.replace(/\/$/, "").replace(/[^a-zA-Z0-9]/g, "-");

@@ -41,6 +41,7 @@ export interface ChatParams {
   cwd: string;
   images?: ImageData[];
   model?: string;
+  settingSources?: string[];
 }
 
 

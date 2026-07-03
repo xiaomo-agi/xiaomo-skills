@@ -53,7 +53,7 @@
 |---|---|---|
 | 会议纪要听完就忘 | **sentinel** | 自动扫描飞书妙记，提取待办/素材/金句 |
 | 创业/流量/内容/销售问题 | **tao 认知 OS（一套）** | 中台调度 7 个子 skill 并行诊断 |
-| 电脑不在身边想用 CC | **mycc** | 手机/网页远程操控 Claude Code |
+| 电脑不在身边想用 CC | **mycc** | 飞书里发消息远程操控 Claude Code |
 
 **不是教程，是即装即用的工具**。每个 skill 复制到 `.claude/skills/` 就能用。
 
@@ -69,7 +69,7 @@
 |---|---|---|---|
 | [sentinel](./skills/sentinel/) | 飞书妙记哨兵。自动扫描新录音，提取待办/素材/金句 | 自动运行 / `sentinel` | lark-cli + 飞书应用 |
 | [sentinel-minimal](./skills/sentinel-minimal/) | 哨兵轻量版。零依赖，只扫描存档不通知 | `sentinel-minimal` | lark-cli |
-| [mycc](./skills/mycc/) | 小程序后端。手机/网页远程操控 CC | `/mycc` | Node.js + cloudflared |
+| [mycc](./skills/mycc/) | 飞书机器人远程操控 CC，支持多会话/文件收发 | `/mycc` | Node.js 18+ + 飞书应用 |
 
 ### 🧠 涛哥认知 OS（一套 8 个）
 
@@ -157,16 +157,17 @@ sentinel 的精简版本：
 
 适合：不想折腾飞书应用、只需要本地存档的用户。
 
-### mycc — 小程序后端
+### mycc — 飞书远程操控后端
 
-Claude Code 远程操控服务：
+在飞书里发消息，远程操控你电脑上的 Claude Code：
 
-- **Web 端**：手机/平板浏览器访问，随时随地用 CC
-- **飞书双向通信**：发消息到飞书 + 接收回复，支持文本/图片/文件
+- **飞书双向通信**：发消息 + 接收回复，支持文本/图片/文件收发
+- **多会话隔离**：不同群/话题各自独立会话，互不干扰、互不阻塞
 - **流式卡片**：AI 回复实时更新到单张卡片
 - **Agent Teams**：多 Agent 协作
+- **稳定性**：WebSocket 断线自动重连、会话崩溃自动恢复、`service start` 一键注册系统服务（开机自启 + 崩溃自动重启）
 
-**前置条件**：Node.js 18+、cloudflared（外网穿透），支持 Windows / macOS / Linux
+**前置条件**：Node.js 18+、一个飞书自建应用（机器人），支持 Windows / macOS / Linux
 
 ### tao — 涛哥认知 OS（一套 8 个）
 
@@ -207,7 +208,7 @@ xiaomo-skills/
     │   ├── rules.md
     │   ├── prompts.md
     │   └── SETUP.md
-    ├── mycc/                          # 小程序后端
+    ├── mycc/                          # 飞书远程操控后端
     │   ├── SKILL.md
     │   └── scripts/                   # 服务端代码
     └── tao-skill/                     # 涛哥系列

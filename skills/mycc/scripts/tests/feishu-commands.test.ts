@@ -10,8 +10,20 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import fs from "fs";
+import path from "path";
 import type { FeishuCommandsDeps } from "../src/channels/feishu-commands.js";
 import { FeishuCommands } from "../src/channels/feishu-commands.js";
+
+/** 会话/模型持久化文件（测试前清理，避免测试间状态泄漏） */
+/** 必须跟 src 侧一致地读 MYCC_DATA_DIR（tests/setup.ts 已重定向到临时目录），
+ *  否则清理逻辑会绕过重定向、直接删生产环境的 src/data/ 文件 */
+const DATA_DIR = process.env.MYCC_DATA_DIR || path.resolve(import.meta.dirname, "../src/data");
+function cleanPersistedState() {
+  for (const f of ["channel-sessions.json", "channel-models.json"]) {
+    try { fs.rmSync(path.join(DATA_DIR, f)); } catch { /* absent */ }
+  }
+}
 
 /** 创建 mock 依赖 */
 function createMockDeps(overrides?: Partial<FeishuCommandsDeps>): FeishuCommandsDeps {
@@ -111,6 +123,7 @@ describe("FeishuCommands", () => {
   let fc: FeishuCommands;
 
   beforeEach(() => {
+    cleanPersistedState();
     deps = createMockDeps();
     fc = new FeishuCommands(deps);
   });
@@ -402,15 +415,94 @@ describe("FeishuCommands", () => {
     });
   });
 
+  // ============ /model 命令 ============
+
+  describe("/model 命令", () => {
+    it("无参数时显示当前模型和用法", async () => {
+      await fc.processMessage("/model");
+
+      const text = getLastBroadcastText(deps);
+      expect(text).toContain("当前模型");
+      expect(text).toContain("sonnet");
+      expect(text).toContain("opus");
+    });
+
+    it("合法别名切换成功并持久化", async () => {
+      await fc.processMessage("/model opus");
+
+      expect(fc.currentModel).toBe("opus");
+      const text = getLastBroadcastText(deps);
+      expect(text).toContain("已切换模型: opus");
+    });
+
+    it("fable5 别名解析为完整模型 ID", async () => {
+      await fc.processMessage("/model fable5");
+
+      expect(fc.currentModel).toBe("claude-fable-5");
+    });
+
+    it("合法完整模型 ID 直接透传", async () => {
+      await fc.processMessage("/model claude-opus-4-6");
+
+      expect(fc.currentModel).toBe("claude-opus-4-6");
+    });
+
+    it("非法输入被拒绝，不修改 currentModel", async () => {
+      await fc.processMessage("/model opus"); // 先设置一个已知合法值
+      await fc.processMessage("/model gpt5"); // 再尝试非法输入
+
+      expect(fc.currentModel).toBe("opus"); // 保持不变
+      const text = getLastBroadcastText(deps);
+      expect(text).toContain("无效的模型");
+      expect(text).toContain("gpt5");
+    });
+
+    it("非法输入（随机打字）给出清晰的错误提示和可选项", async () => {
+      await fc.processMessage("/model sonet"); // 打错的别名
+
+      expect(fc.currentModel).toBeNull();
+      const text = getLastBroadcastText(deps);
+      expect(text).toContain("无效的模型");
+      expect(text).toContain("sonnet");
+    });
+
+    it("切换模型时会驱逐当前 scope 已绑定的活跃 session，下一条消息用新 model 重新走 resumeSession", async () => {
+      fc.currentSessionId = "active-sess";
+
+      await fc.processMessage("/model opus");
+
+      // 已绑定的 session 应该被从 adapter 池里驱逐（closeSession），
+      // 这样下一条消息触发的 chat() 会走 resumeSession 拿到新 model，而不是复用池里的旧 session 对象
+      expect(deps.adapter.closeSession).toHaveBeenCalledWith("active-sess");
+
+      // sessionId 绑定本身保留（不丢失会话身份/历史），只是底层 session 对象被驱逐重建
+      expect(fc.currentSessionId).toBe("active-sess");
+
+      await fc.processMessage("继续聊");
+
+      const chatCall = (deps.adapter.chat as any).mock.calls[0][0];
+      expect(chatCall.sessionId).toBe("active-sess");
+      expect(chatCall.model).toBe("opus");
+    });
+
+    it("非法输入不会驱逐已绑定的 session", async () => {
+      fc.currentSessionId = "active-sess";
+      (deps.adapter.closeSession as any).mockClear();
+
+      await fc.processMessage("/model gpt5");
+
+      expect(deps.adapter.closeSession).not.toHaveBeenCalled();
+    });
+  });
+
   // ============ 未知命令 ============
 
   describe("未知命令", () => {
-    it("返回未知命令提示", async () => {
+    it("转发给 Claude Code 作为普通消息（飞书调 skill 的入口）", async () => {
       await fc.processMessage("/unknown");
 
-      const text = getLastBroadcastText(deps);
-      expect(text).toContain("未知命令");
-      expect(text).toContain("/unknown");
+      const chatCall = (deps.adapter.chat as any).mock.calls[0][0];
+      expect(chatCall.message).toBe("/unknown");
     });
   });
 
@@ -493,6 +585,42 @@ describe("FeishuCommands", () => {
 
       const text = getLastBroadcastText(deps);
       expect(text).toContain("处理消息时出错");
+    });
+
+    it("流式模式下出错时，错误提示追加在已生成的部分内容之后，而不是被吞掉", async () => {
+      fc.currentSessionId = "active-sess";
+
+      // 启用流式卡片：feishuChannel 需要提供 getConfig/getReplyTarget/createStreamingSession
+      const closeMock = vi.fn(async () => {});
+      const streamingSession = {
+        start: vi.fn(async () => {}),
+        update: vi.fn(async () => {}),
+        close: closeMock,
+      };
+      deps.feishuChannel = {
+        ...deps.feishuChannel,
+        getConfig: vi.fn(() => ({ appId: "app1", appSecret: "secret1" })),
+        getReplyTarget: vi.fn(() => ({ receiveId: "chat1", receiveIdType: "chat_id" as const })),
+        createStreamingSession: vi.fn(() => streamingSession),
+      };
+
+      // chat 先吐出部分正文，再在流中途报错（模拟原 bug 场景：accumulatedText 非空 + 出错）
+      deps.adapter.chat = vi.fn(async function* () {
+        yield {
+          type: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: "已经写了一部分回复" }] },
+        };
+        throw new Error("adapter boom");
+      }) as any;
+
+      await fc.processMessage("你好", undefined, undefined, "msg-1");
+
+      expect(closeMock).toHaveBeenCalledTimes(1);
+      const finalText = closeMock.mock.calls[0][0];
+      // 回归断言：修复前 `accumulatedText || 错误提示` 会因为 accumulatedText 非空
+      // 而把错误提示整个丢掉，这里必须两者都在
+      expect(finalText).toContain("已经写了一部分回复");
+      expect(finalText).toContain("处理消息时出错");
     });
 
     it("支持传递图片", async () => {

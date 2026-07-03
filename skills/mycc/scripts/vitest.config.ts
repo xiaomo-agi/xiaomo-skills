@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
+    setupFiles: ["./tests/setup.ts"],
     include: ["tests/**/*.test.ts"],
     exclude: ["tests/concurrency.test.ts"], // 独立脚本，需手动运行
     coverage: {

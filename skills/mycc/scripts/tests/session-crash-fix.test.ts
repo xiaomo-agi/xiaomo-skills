@@ -52,13 +52,14 @@ describe("http-server.ts: HTTP 错误时清理 session", () => {
     source = readFileSync(join(SRC, "http-server.ts"), "utf-8");
   });
 
-  it("catch 块调用 adapter.closeSession(currentSessionId)", () => {
-    expect(source).toContain("adapter.closeSession(currentSessionId)");
+  it("catch 块调用 chatAdapter.closeSession(currentSessionId)", () => {
+    // Phase 3 多供应商路由后，closeSession 走按 provider 解析出的 chatAdapter
+    expect(source).toContain("chatAdapter.closeSession(currentSessionId)");
   });
 
   it("closeSession 调用有 if (currentSessionId) 守卫", () => {
     // 防止 sessionId 为 undefined 时调用
-    expect(source).toMatch(/if\s*\(currentSessionId\)\s*\{[\s\S]*?adapter\.closeSession/);
+    expect(source).toMatch(/if\s*\(currentSessionId\)\s*\{[\s\S]*?chatAdapter\.closeSession/);
   });
 
   it("关闭异常 session 有日志", () => {
@@ -223,5 +224,40 @@ describe("OfficialAdapter session 池管理", () => {
     expect(activeFn).not.toHaveBeenCalled();
     expect(sessions.has("active")).toBe(true);
     expect(sessions.has("expired")).toBe(false);
+  });
+});
+// ============ 6. Feishu WebSocket watchdog ============
+
+describe("Feishu WebSocket watchdog", () => {
+  let source: string;
+
+  beforeEach(() => {
+    source = readFileSync(join(SRC, "channels", "feishu.ts"), "utf-8");
+  });
+
+  it("schedules a restart when WebSocket reconnect state is stale", () => {
+    expect(source).toContain("scheduleWebSocketRestart");
+    expect(source).toContain("reconnect_stale");
+  });
+
+  it("uses a watchdog to inspect SDK reconnect state", () => {
+    expect(source).toContain("startWebSocketWatchdog");
+    expect(source).toContain("getReconnectInfo");
+  });
+});
+
+// ============ 7. SDK session recovery ============
+
+describe("FeishuCommands session recovery", () => {
+  let source: string;
+
+  beforeEach(() => {
+    source = readFileSync(join(SRC, "channels", "feishu-commands.ts"), "utf-8");
+  });
+
+  it("closes stale sessions and retries once for recoverable session errors", () => {
+    expect(source).toContain("chatWithSessionRecovery");
+    expect(source).toContain("isRecoverableSessionError");
+    expect(source).toContain("adapter.closeSession");
   });
 });

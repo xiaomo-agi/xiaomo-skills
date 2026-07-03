@@ -7,9 +7,9 @@ import http from "http";
 import https from "https";
 import os from "os";
 import { join } from "path";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, mkdirSync } from "fs";
 import { generateToken } from "./utils.js";
-import { adapter } from "./adapters/index.js";
+import { adapter, getAdapter, type CCAdapter } from "./adapters/index.js";
 import type { PairState } from "./types.js";
 import { validateImages, type ImageData } from "./image-utils.js";
 import { renameSession, getHistoryDir, scanSessionFiles } from "./history.js";
@@ -20,8 +20,23 @@ import { loadConfig } from "./config.js";
 import { SessionStats } from "./session-stats.js";
 import { FeishuCommands } from "./channels/feishu-commands.js";
 import { resolveAgentDir, listAgents } from "./agent-resolver.js";
+import { handleScheduleRoute } from "./schedule-api.js";
+import { handleWishlistRoute } from "./wishlist-api.js";
+import { forbiddenWorkdirReason } from "./workdir-guard.js";
 
 const PORT = process.env.PORT || 18080;
+
+/**
+ * 飞书 mention 的 id 字段可能是字符串（"all"/"_all"）或对象（{open_id, user_id, union_id}）。
+ * 这里统一比较：把对象的 open_id 拎出来和目标字符串比。
+ */
+function mentionIdEquals(mention: any, target: string): boolean {
+  if (!mention) return false;
+  const id = mention.id;
+  if (typeof id === "string") return id === target;
+  if (id && typeof id === "object") return id.open_id === target;
+  return false;
+}
 
 export interface TlsConfig {
   certPath: string;
@@ -44,8 +59,8 @@ export class HttpServer {
   private onPaired?: (token: string) => void;
   private isTls: boolean;
   private channelManager: ChannelManager;
-  private feishuChannel: any = null;
-  private feishuCommands: FeishuCommands;
+  private feishuChannels: any[] = [];
+  private feishuCommandSets: FeishuCommands[] = [];
   private stats: SessionStats;
 
   /** 代理：暴露底层 Map 供内部/测试访问 */
@@ -89,14 +104,7 @@ export class HttpServer {
     // 初始化统计模块
     this.stats = new SessionStats();
 
-    // 初始化飞书命令模块（feishuChannel 延迟注入，start() 中完成）
-    this.feishuCommands = new FeishuCommands({
-      adapter,
-      channelManager: this.channelManager,
-      cwd: this.cwd,
-      feishuChannel: null,
-      loadConfig,
-    });
+    // 飞书命令模块将在 start() 中为每个通道独立创建
 
     const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
       this.handleRequest(req, res);
@@ -176,6 +184,19 @@ export class HttpServer {
         this.handleEvents(req, res);
       } else if (url.pathname === "/status" && req.method === "GET") {
         await this.handleStatus(req, res);
+      } else if (url.pathname.startsWith("/api/schedule")) {
+        // 日程预约 API（公开，无需 mycc auth）
+        const handled = await handleScheduleRoute(req, res, url.pathname);
+        if (!handled) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Not Found" }));
+        }
+	      } else if (url.pathname.startsWith("/api/wishlist")) {
+	        const handled = await handleWishlistRoute(req, res, url.pathname, this.state.token);
+	        if (!handled) {
+	          res.writeHead(404, { "Content-Type": "application/json" });
+	          res.end(JSON.stringify({ error: "Not Found" }));
+	        }
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Not Found" }));
@@ -286,13 +307,25 @@ export class HttpServer {
       res.end(JSON.stringify({ error: "Invalid JSON" }));
       return;
     }
-    const { message, sessionId, images, model, agentId } = parsed as {
+    const { message, sessionId, images, model, agentId, provider } = parsed as {
       message: string;
       sessionId?: string;
       images?: ImageData[];
       model?: string;
       agentId?: string;
+      provider?: string;
     };
+
+    // 多供应商路由：provider 非法/未注册 → 4xx，不传 = claude（向后兼容）
+    let chatAdapter: CCAdapter;
+    try {
+      chatAdapter = getAdapter(provider || undefined);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: errMsg }));
+      return;
+    }
 
     // agentId 路由：解析为 Agent 目录
     let effectiveCwd = this.cwd;
@@ -354,12 +387,15 @@ export class HttpServer {
 
     try {
       // 使用 adapter 的 chat 方法（返回 AsyncIterable）
-      for await (const data of adapter.chat({ message: chatMessage, sessionId, cwd: effectiveCwd, images, model: model || undefined, settingSources })) {
+      for await (const data of chatAdapter.chat({ message: chatMessage, sessionId, cwd: effectiveCwd, images, model: model || undefined, settingSources })) {
         if (data && typeof data === "object" && "type" in data) {
           // 提取 session_id
           if (data.type === "system" && "session_id" in data) {
             currentSessionId = data.session_id as string;
-            this.feishuCommands.currentSessionId = currentSessionId;
+            // 同步 sessionId 到所有飞书命令集
+            for (const cmds of this.feishuCommandSets) {
+              cmds.currentSessionId = currentSessionId;
+            }
             webChannel.setSessionId(currentSessionId);
           }
 
@@ -409,7 +445,7 @@ export class HttpServer {
 
       // 关闭死掉的 session，防止污染池（下次请求复用死 session 导致级联崩溃）
       if (currentSessionId) {
-        adapter.closeSession(currentSessionId);
+        chatAdapter.closeSession(currentSessionId);
         console.log(`[CC] 已关闭异常 session: ${currentSessionId}`);
       }
 
@@ -434,14 +470,25 @@ export class HttpServer {
       return;
     }
 
+    // 解析 provider 参数（?provider=codex），非法/未注册 → 400
+    const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
+    let historyAdapter: CCAdapter;
+    try {
+      historyAdapter = getAdapter(url.searchParams.get("provider") || undefined);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: errMsg }));
+      return;
+    }
+
     try {
       // 解析 limit 参数（默认 20，传 0 或不传数字则返回全部）
-      const url = new URL(req.url || "", `http://${req.headers.host}`);
       const limitParam = url.searchParams.get("limit");
       const limit = limitParam ? parseInt(limitParam, 10) : 20;
 
       // 使用 adapter 的 listHistory 方法
-      const result = await adapter.listHistory(this.cwd, limit);
+      const result = await historyAdapter.listHistory(this.cwd, limit);
 
       console.log(`[History] 返回 ${result.conversations.length}/${result.total} 条历史记录 (cwd: ${this.cwd})`);
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -473,9 +520,21 @@ export class HttpServer {
       return;
     }
 
+    // 解析 provider 参数（?provider=codex），非法/未注册 → 400
+    let historyAdapter: CCAdapter;
+    try {
+      const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
+      historyAdapter = getAdapter(url.searchParams.get("provider") || undefined);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: errMsg }));
+      return;
+    }
+
     try {
       // 使用 adapter 的 getHistory 方法
-      const conversation = await adapter.getHistory(this.cwd, sessionId);
+      const conversation = await historyAdapter.getHistory(this.cwd, sessionId);
       if (!conversation) {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "对话不存在" }));
@@ -756,22 +815,157 @@ export class HttpServer {
       this.server.listen(port, async () => {
         console.log(`[${this.isTls ? "HTTPS" : "HTTP"}] 服务启动在端口 ${port}`);
 
-        // 动态加载并注册飞书通道（如果配置了环境变量）
-        if (process.env.CHANNEL_FEISHU !== "false" && process.env.FEISHU_APP_ID && process.env.FEISHU_APP_SECRET) {
-          try {
-            const { FeishuChannel } = await import("./channels/feishu.js");
-            this.feishuChannel = new FeishuChannel();
-            this.feishuChannel.onMessage(async (message: string, images?: Array<{ data: string; mediaType: string }>, files?: Array<{ filePath: string; fileName: string }>, messageId?: string) => {
-              await this.feishuCommands.processMessage(message, images, files, messageId);
-            });
-            this.channelManager.register(this.feishuChannel);
-            // 注入 feishuChannel 到 FeishuCommands（延迟注入）
-            (this.feishuCommands as any).deps.feishuChannel = this.feishuChannel;
-            console.log("[Channels] 飞书通道已注册");
-          } catch (err) {
-            console.warn("[Channels] 飞书通道加载失败:", err);
+        // 动态加载并注册飞书通道（支持多通道 A/B/C/D/E）
+        const feishuConfigs = [
+          { suffix: "", label: "A" },
+          { suffix: "_B", label: "B" },
+          { suffix: "_C", label: "C" },
+          { suffix: "_D", label: "D" },
+          { suffix: "_E", label: "E" },
+        ];
+
+        // 新增：Agent 群组路由系统
+        const { AgentRouter } = await import("./agent-router.js");
+        const router = new AgentRouter();
+        const channelCommandsMap = new Map<string, { channel: any; commands: FeishuCommands }>();
+
+        for (const cfg of feishuConfigs) {
+          const appIdKey = `FEISHU${cfg.suffix}_APP_ID`;
+          const appSecretKey = `FEISHU${cfg.suffix}_APP_SECRET`;
+          const appId = process.env[appIdKey];
+          const appSecret = process.env[appSecretKey];
+
+          if (process.env.CHANNEL_FEISHU !== "false" && appId && appSecret) {
+            try {
+              const { FeishuChannel } = await import("./channels/feishu.js");
+
+              // 构造通道配置
+              const channelConfig = {
+                appId,
+                appSecret,
+                receiveUserId: process.env[`FEISHU${cfg.suffix}_RECEIVE_USER_ID`],
+                receiveIdType: (process.env[`FEISHU${cfg.suffix}_RECEIVE_ID_TYPE`] as "open_id" | "chat_id") || "open_id",
+                connectionMode: (process.env[`FEISHU${cfg.suffix}_CONNECTION_MODE`] as "websocket" | "poll") || "websocket",
+                encryptKey: process.env[`FEISHU${cfg.suffix}_ENCRYPT_KEY`],
+                verificationToken: process.env[`FEISHU${cfg.suffix}_VERIFICATION_TOKEN`],
+                showToolUse: process.env[`FEISHU${cfg.suffix}_SHOW_TOOL_USE`] === "false" ? false : true,
+                label: cfg.label,
+                streamingCards: process.env[`FEISHU${cfg.suffix}_STREAMING_CARDS`] !== "false",
+              };
+
+              const feishuChannel = new FeishuChannel(channelConfig);
+
+              // 为每个通道创建独立的 cwd 子目录，实现会话隔离
+              // 可用 FEISHU{suffix}_CWD 覆盖（如需让 bot 直接工作在项目根目录）
+              let channelCwd = process.env[`FEISHU${cfg.suffix}_CWD`]
+                || join(this.cwd, `.mycc-channels`, cfg.label.toLowerCase());
+              // 工作目录红线：环境变量指了危险目录时退回默认隔离目录，不让 Agent 裸奔
+              const forbidden = forbiddenWorkdirReason(channelCwd);
+              if (forbidden) {
+                const fallback = join(this.cwd, `.mycc-channels`, cfg.label.toLowerCase());
+                console.warn(`[HttpServer] ⚠ FEISHU${cfg.suffix}_CWD 踩红线（${forbidden}），退回 ${fallback}`);
+                channelCwd = fallback;
+              }
+              if (!existsSync(channelCwd)) {
+                mkdirSync(channelCwd, { recursive: true });
+              }
+
+              // 为每个通道创建独立的 FeishuCommands
+              const feishuCommands = new FeishuCommands({
+                adapter,
+                channelManager: this.channelManager,
+                cwd: channelCwd,
+                feishuChannel: feishuChannel,
+                loadConfig,
+              });
+
+              // 注册到 Router
+              channelCommandsMap.set(cfg.label, { channel: feishuChannel, commands: feishuCommands });
+              router.register(cfg.label.toLowerCase(), feishuCommands);
+
+              // 卡片按钮点击 → 命令处理（Phase 5）。点击的一定是本 bot 自己
+              // 发的卡片，事件只会推给发卡片的应用，无需 mention 路由判断
+              feishuChannel.onCardAction(async (value: Record<string, unknown>, cardCtx: any) => {
+                await feishuCommands.processCardAction(value, cardCtx);
+              });
+
+              // B/C/D/E：只处理@自己的消息，@all由A路由，其他忽略
+              if (cfg.label !== "A") {
+                feishuChannel.onMessage(async (message: string, images?: Array<{ data: string; mediaType: string }>, files?: Array<{ filePath: string; fileName: string }>, messageId?: string, msgCtx?: any) => {
+                  // 优先用消息自带的 ctx（多会话并发时全局 lastMessageContext 会串）
+                  const mentions = msgCtx?.mentions ?? feishuChannel.getLastMessageContext()?.mentions;
+                  const isAllMention = mentions?.some((m: any) => mentionIdEquals(m, "all") || mentionIdEquals(m, "_all"));
+                  if (isAllMention) {
+                    console.log(`[AgentRouter] 群@all消息，通道 ${cfg.label} 忽略`);
+                    return;
+                  }
+
+                  const botOpenId = feishuChannel.getBotOpenId();
+                  // botOpenId 获取失败时不处理任何消息，避免误响应
+                  if (!botOpenId) {
+                    console.log(`[AgentRouter] 通道 ${cfg.label} botOpenId 未知，忽略消息`);
+                    return;
+                  }
+                  const isMentionMe = mentions?.some((m: any) => mentionIdEquals(m, botOpenId));
+                  const hasAnyBotMention = mentions?.some((m: any) => !mentionIdEquals(m, "all") && !mentionIdEquals(m, "_all"));
+
+                  if (isMentionMe) {
+                    // @了本bot：直接处理
+                    await feishuCommands.processMessage(message, images, files, messageId, msgCtx);
+                  } else if (!hasAnyBotMention) {
+                    // 没@任何人：默认处理（私聊或无目标的消息）
+                    await feishuCommands.processMessage(message, images, files, messageId, msgCtx);
+                  } else {
+                    // @了其他bot：忽略
+                    console.log(`[AgentRouter] 通道 ${cfg.label} 忽略（@了其他bot）`);
+                  }
+                });
+              }
+
+              // 给每个通道唯一的 id，避免 channelManager 中互相覆盖
+              (feishuChannel as any).id = `feishu-${cfg.label.toLowerCase()}`;
+              this.channelManager.register(feishuChannel);
+              this.feishuChannels.push(feishuChannel);
+              this.feishuCommandSets.push(feishuCommands);
+
+              console.log(`[Channels] 飞书通道 ${cfg.label} 已注册 (${appId})`);
+            } catch (err) {
+              console.warn(`[Channels] 飞书通道 ${cfg.label} 加载失败:`, err);
+            }
           }
-        } else {
+        }
+
+        // 设置群主通道 A 的群路由：群@all 走路由，@自己处理，@其他bot忽略，没@任何人默认处理
+        const leader = channelCommandsMap.get("A");
+        if (leader) {
+          router.setMainChannel(leader.channel);
+          leader.channel.onMessage(async (message: string, images?: Array<{ data: string; mediaType: string }>, files?: Array<{ filePath: string; fileName: string }>, messageId?: string, msgCtx?: any) => {
+            // 优先用消息自带的 ctx（多会话并发时全局 lastMessageContext 会串）
+            const mentions = msgCtx?.mentions ?? leader.channel.getLastMessageContext()?.mentions;
+            const isAllMention = mentions?.some((m: any) => mentionIdEquals(m, "all") || mentionIdEquals(m, "_all"));
+            if (isAllMention) {
+              await router.route(message, images, files, messageId, msgCtx);
+              return;
+            }
+
+            const botOpenId = leader.channel.getBotOpenId();
+            const hasAnyBotMention = mentions?.some((m: any) => !mentionIdEquals(m, "all") && !mentionIdEquals(m, "_all"));
+
+            if (botOpenId && mentions?.some((m: any) => mentionIdEquals(m, botOpenId))) {
+              // @了A自己：A直接处理
+              await leader.commands.processMessage(message, images, files, messageId, msgCtx);
+            } else if (!hasAnyBotMention) {
+              // 没@任何人：A作为默认bot处理
+              await leader.commands.processMessage(message, images, files, messageId, msgCtx);
+            } else {
+              // @了其他bot或botOpenId未知：A忽略
+              console.log("[AgentRouter] A通道忽略（@了其他bot或botOpenId未知）");
+            }
+          });
+          console.log("[Channels] 群主通道 A 已配置群路由");
+        }
+
+        if (this.feishuChannels.length === 0) {
           console.log("[Channels] 飞书通道未配置");
         }
 

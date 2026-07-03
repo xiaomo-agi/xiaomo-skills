@@ -8,6 +8,7 @@
  */
 
 import { existsSync, readFileSync } from "fs";
+import { homedir } from "os";
 import { join } from "path";
 
 /**
@@ -103,6 +104,36 @@ export function loadEnvFile(...searchDirs: string[]): void {
     } catch {
       // 读取失败，跳过
     }
+  }
+}
+
+/**
+ * Load Claude Code auth env from ~/.claude/settings.json.
+ *
+ * This keeps mycc from falling back to stale ~/.claude/.credentials.json OAuth
+ * tokens when it is launched from a shell that does not already have the new
+ * provider token in its environment.
+ */
+export function loadClaudeSettingsEnv(settingsPath = join(homedir(), ".claude", "settings.json")): void {
+  if (!existsSync(settingsPath)) return;
+
+  try {
+    const raw = readFileSync(settingsPath, "utf-8");
+    const settings = JSON.parse(raw) as { env?: Record<string, unknown> };
+    const env = settings.env;
+    if (!env || typeof env !== "object") return;
+
+    for (const [key, value] of Object.entries(env)) {
+      if (!key.startsWith("ANTHROPIC_")) continue;
+      if (typeof value !== "string" || value.length === 0) continue;
+      process.env[key] = value;
+    }
+
+    if (typeof env.ANTHROPIC_AUTH_TOKEN === "string" && env.ANTHROPIC_AUTH_TOKEN.length > 0) {
+      delete process.env.ANTHROPIC_API_KEY;
+    }
+  } catch {
+    // Ignore unreadable or malformed settings; normal CLI auth fallback still applies.
   }
 }
 

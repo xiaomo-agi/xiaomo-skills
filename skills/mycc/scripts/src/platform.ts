@@ -232,6 +232,52 @@ export async function checkCCAvailable(): Promise<boolean> {
   }
 }
 
+// ============ Codex CLI 路径探测 ============
+
+/**
+ * 检测 Codex CLI 路径
+ * 策略链：环境变量 → which/where → 裸命令名（复用 resolve-executable 策略链）
+ */
+export function detectCodexPath(): string {
+  const result = resolveExecutable(
+    [
+      envVar("CODEX_PATH"),
+      whichCommand("codex"),
+      fallback("codex"),
+    ],
+    createRealContext()
+  );
+  return result!.path;
+}
+
+/**
+ * 检查 Codex CLI 是否可用（模式与 checkCCAvailable 一致）
+ */
+export async function checkCodexAvailable(): Promise<boolean> {
+  try {
+    const codexPath = detectCodexPath();
+    execSync(`"${codexPath}" --version`, { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 启动期可用性决策（供 index.ts 使用，抽出来便于单测）：
+ * - Claude 可用 → 正常模式（与现状零变化）
+ * - Claude 不可用但 Codex 可用 → codex-only 模式（警告后继续启动）
+ * - 两者都不可用 → 拒绝启动
+ */
+export function decideStartupMode(
+  ccAvailable: boolean,
+  codexAvailable: boolean
+): { ok: true; mode: "claude" | "codex-only" } | { ok: false } {
+  if (ccAvailable) return { ok: true, mode: "claude" };
+  if (codexAvailable) return { ok: true, mode: "codex-only" };
+  return { ok: false };
+}
+
 /**
  * 检查 cloudflared 是否可用
  */

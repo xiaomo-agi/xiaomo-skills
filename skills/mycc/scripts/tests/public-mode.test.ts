@@ -12,7 +12,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
-import { parseEnvFile, loadPublicUrl } from "../src/env-loader.js";
+import { parseEnvFile, loadPublicUrl, loadClaudeSettingsEnv } from "../src/env-loader.js";
 
 // ============ parseEnvFile 测试 ============
 
@@ -183,3 +183,54 @@ describe("tunnelManager 可选链", () => {
     expect(tunnelManager?.getStatus()).toBeUndefined();
   });
 });
+
+describe("loadClaudeSettingsEnv()", () => {
+  let tempDir: string;
+  let settingsPath: string;
+  let originalAuthToken: string | undefined;
+  let originalApiKey: string | undefined;
+  let originalBaseUrl: string | undefined;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "mycc-claude-settings-"));
+    settingsPath = join(tempDir, "settings.json");
+    originalAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    originalApiKey = process.env.ANTHROPIC_API_KEY;
+    originalBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    process.env.ANTHROPIC_AUTH_TOKEN = "old-token";
+    process.env.ANTHROPIC_API_KEY = "old-api-key";
+    delete process.env.ANTHROPIC_BASE_URL;
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+    restoreEnv("ANTHROPIC_AUTH_TOKEN", originalAuthToken);
+    restoreEnv("ANTHROPIC_API_KEY", originalApiKey);
+    restoreEnv("ANTHROPIC_BASE_URL", originalBaseUrl);
+  });
+
+  it("loads Anthropic env from Claude settings and removes conflicting API key", () => {
+    writeFileSync(settingsPath, JSON.stringify({
+      env: {
+        ANTHROPIC_AUTH_TOKEN: "new-token",
+        ANTHROPIC_BASE_URL: "https://example.com/api/anthropic",
+        OTHER_ENV: "ignored",
+      },
+    }));
+
+    loadClaudeSettingsEnv(settingsPath);
+
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe("new-token");
+    expect(process.env.ANTHROPIC_BASE_URL).toBe("https://example.com/api/anthropic");
+    expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(process.env.OTHER_ENV).toBeUndefined();
+  });
+});
+
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}

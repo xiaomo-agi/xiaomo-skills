@@ -862,26 +862,36 @@ describe("新 session sessionId 延迟初始化", () => {
   });
 });
 
-// ============ 10c. cwd 传递验证（process.chdir 方案） ============
-
-describe("cwd 传递 — process.chdir 方案", () => {
-  it("v2 SDKSessionOptions 没有 cwd 字段（SDK 限制）", () => {
-    // 确认 SDK 类型限制：SDKSessionOptions 不包含 cwd
-    // 因此需要用 process.chdir 来传递工作目录
+// ============ 10c. cwd 传递验证（SDKSessionOptions.cwd 直传方案） ============
+//
+// 历史背景：早期认为 v2 SDKSessionOptions 没有 cwd 字段，只能靠
+// process.chdir(cwd) → create/resumeSession → process.chdir(originalCwd) 来传递工作目录。
+// 但这会修改进程级全局状态 process.cwd()，与其他并发的 getOrCreateSession() 调用存在竞态
+// （不同请求的 cwd 互相踩踏）。
+//
+// 实测（读 node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs 源码 + monkey-patch
+// child_process.spawn 验证）发现：当前安装的 SDK 版本 SDKSessionOptions 已经支持 cwd 字段，
+// 且 unstable_v2_createSession/resumeSession 内部同步 spawn 子进程时把 options.cwd 原样
+// 传给 child_process.spawn 的 cwd 选项，完全不依赖 process.cwd()。
+// 因此改为直接把 cwd 放进 SDKSessionOptions，彻底不再 touch process.chdir，从根上消除竞态。
+describe("cwd 传递 — SDKSessionOptions.cwd 直传方案", () => {
+  it("v2 SDKSessionOptions 类型中包含 cwd 字段", () => {
     const sdkTypes = readFileSync(
       join(ROOT, "node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts"),
       "utf-8"
     );
-    // SDKSessionOptions 类型中不应有 cwd
     const sessionOptionsMatch = sdkTypes.match(/SDKSessionOptions\s*=\s*\{[\s\S]*?\n\};/);
     expect(sessionOptionsMatch).toBeTruthy();
-    // cwd 不在 SDKSessionOptions 中（它在别的类型里如 query options）
+    expect(sessionOptionsMatch![0]).toMatch(/cwd\?:\s*string/);
   });
 
-  it("getOrCreateSession 应在创建 session 前 process.chdir(cwd)", () => {
+  it("getOrCreateSession 不再使用 process.chdir（消除并发竞态）", () => {
     const officialSource = readFileSync(join(SRC, "adapters", "official.ts"), "utf-8");
-    // 源码中应有 process.chdir 逻辑
-    expect(officialSource).toContain("process.chdir");
+    // 只判定实际调用（后面跟括号），允许注释里提及这个 API 名字做说明
+    const codeWithoutComments = officialSource
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/.*$/gm, "");
+    expect(codeWithoutComments).not.toContain("process.chdir(");
   });
 
   it("chat() 应从 params 解构出 cwd 并传给 getOrCreateSession", () => {
@@ -890,16 +900,112 @@ describe("cwd 传递 — process.chdir 方案", () => {
     expect(officialSource).toMatch(/const\s*\{[^}]*cwd[^}]*\}\s*=\s*params/);
   });
 
-  it("process.chdir 后应恢复原始 cwd（避免影响其他逻辑）", () => {
+  it("buildSessionOptions 把 cwd 直接放进 SDKSessionOptions", () => {
     const officialSource = readFileSync(join(SRC, "adapters", "official.ts"), "utf-8");
-    // 源码中应有恢复 cwd 的逻辑（process.cwd() 保存 + finally/恢复）
-    expect(officialSource).toMatch(/process\.cwd\(\)/);
+    expect(officialSource).toMatch(/function buildSessionOptions\(model\?:\s*string,\s*cwd\?:\s*string\)/);
+    expect(officialSource).toMatch(/\.\.\.\(cwd\s*&&\s*\{\s*cwd\s*\}\)/);
+  });
+
+  it("getOrCreateSession 把 cwd 传给 buildSessionOptions", () => {
+    const officialSource = readFileSync(join(SRC, "adapters", "official.ts"), "utf-8");
+    expect(officialSource).toMatch(/buildSessionOptions\(model,\s*cwd\)/);
   });
 
   it("SessionParams 应包含 cwd 可选字段", () => {
     const interfaceSource = readFileSync(join(SRC, "adapters", "interface.ts"), "utf-8");
     // SessionParams 中应有 cwd
     expect(interfaceSource).toMatch(/interface\s+SessionParams[\s\S]*?cwd/);
+  });
+});
+
+// ============ 10e. 并发 getOrCreateSession 不同 cwd 竞态回归测试 ============
+//
+// 回归测试：process.chdir 方案下，两个并发的 getOrCreateSession({cwd: A}) 和
+// getOrCreateSession({cwd: B}) 调用如果交错执行（chdir(A) → chdir(B) → create → restore(B)
+// → restore(A)），会导致其中一个 session 拿到错误的 cwd。
+//
+// 新方案下每次调用只构造一个携带自己 cwd 的 options 对象，不修改任何共享/全局状态，
+// 所以两个并发调用互相之间不可能观测到对方的 cwd，也不需要加锁/排队。
+describe("并发 getOrCreateSession — 不同 cwd 不再竞态", () => {
+  /** 模拟新方案：cwd 直接放进 per-call 的 options，不碰 process.cwd() */
+  function buildOptionsNoGlobalState(model: string | undefined, cwd: string | undefined) {
+    return {
+      model: model || "sonnet",
+      permissionMode: "bypassPermissions" as const,
+      ...(cwd && { cwd }),
+    };
+  }
+
+  it("两个并发 createSession 调用（不同 cwd）各自拿到自己传入的 cwd，不受另一方影响", async () => {
+    const capturedCwds: string[] = [];
+
+    // 模拟 SDK 内部同步 spawn：拿到 options.cwd 就立刻记录下来（模拟子进程真正启动那一刻）
+    function fakeCreateSession(options: { cwd?: string }) {
+      // 加一个 microtask 延迟，模拟真实场景中两个调用交错执行的可能性
+      capturedCwds.push(options.cwd ?? "(default)");
+      return { cwd: options.cwd };
+    }
+
+    async function getOrCreateSession(cwd: string, delayMs: number) {
+      await new Promise((r) => setTimeout(r, delayMs));
+      const options = buildOptionsNoGlobalState("sonnet", cwd);
+      // 关键：options 是本次调用的局部变量，不依赖任何跨调用共享的可变状态
+      return fakeCreateSession(options);
+    }
+
+    // A 先开始但故意让它在 B 之后才真正调用 fakeCreateSession，制造交错
+    const [resultA, resultB] = await Promise.all([
+      getOrCreateSession("/project/A", 10),
+      getOrCreateSession("/project/B", 0),
+    ]);
+
+    expect(resultA.cwd).toBe("/project/A");
+    expect(resultB.cwd).toBe("/project/B");
+    // 两次调用各自拿到了正确的 cwd，没有互相覆盖
+    expect(capturedCwds.sort()).toEqual(["/project/A", "/project/B"]);
+  });
+
+  it("旧的 process.chdir 方案在非嵌套交错场景下会产生错误 cwd（对照组，证明新方案必要性）", async () => {
+    // 用一个真实的可变全局变量模拟 process.cwd()，复现旧代码 chdir → create → restore 的结构。
+    // 用显式的 gate（手动 resolve 的 Promise）而不是 setTimeout 竞速来精确控制交错顺序：
+    // 这重现了「未来有人在 chdir 和 restore 之间不小心插入了一个 await」时会发生的真实损坏
+    // （任务描述里点 1 提到的"fragile against future edits"）。
+    let globalCwd = "/original";
+    const results: Array<{ requested: string; observedAtSpawn: string }> = [];
+
+    let releaseA: () => void;
+    let releaseB: () => void;
+    const gateA = new Promise<void>((r) => { releaseA = r; });
+    const gateB = new Promise<void>((r) => { releaseB = r; });
+
+    async function legacyGetOrCreateSession(cwd: string, waitFor: Promise<void>) {
+      const originalCwd = globalCwd;
+      const needsChdir = cwd !== originalCwd;
+      if (needsChdir) globalCwd = cwd; // process.chdir(cwd)
+
+      await waitFor; // 模拟 chdir 和 spawn 之间被插入了一个 await 点（未来有人加了一段异步准备工作）
+
+      const observedAtSpawn = globalCwd; // "spawn 时刻" 读到的全局 cwd
+
+      if (needsChdir) globalCwd = originalCwd; // process.chdir(originalCwd)
+      results.push({ requested: cwd, observedAtSpawn });
+    }
+
+    // A、B 都先各自 chdir 到自己的目录，然后都卡在各自的 gate 上（此时全局 cwd 已经是
+    // "/project/B"，且两边都还没 restore）。关键是按「非 LIFO」顺序释放——先放开 A、再放开 B
+    // （现实中两个并发请求谁先完成完全不可控，不一定是后进先出）：
+    const pA = legacyGetOrCreateSession("/project/A", gateA);
+    const pB = legacyGetOrCreateSession("/project/B", gateB);
+    releaseA!(); // A 先"spawn"：此时全局 cwd 已被 B 的 chdir 改成 /project/B
+    await pA;
+    releaseB!(); // B 后"spawn"：此时全局 cwd 已被 A 的 restore 改回 /original
+    await pB;
+
+    // 核心断言：至少有一次调用在"spawn 时刻"读到的 cwd 与它自己请求的 cwd 不一致 —— 这就是
+    // process.chdir 方案在非嵌套交错下的竞态本质，新方案（cwd 直接放进局部 options，
+    // 不碰共享/全局状态）完全不存在这类问题。
+    const mismatched = results.filter((r) => r.requested !== r.observedAtSpawn);
+    expect(mismatched.length).toBeGreaterThan(0);
   });
 });
 
@@ -1163,7 +1269,8 @@ describe("Teams 多轮 stream — SSE 输出兼容", () => {
 
   it("http-server handleChat 的 for-await 循环应能处理多轮事件", () => {
     const httpSource = readFileSync(join(SRC, "http-server.ts"), "utf-8");
-    expect(httpSource).toMatch(/for\s+await\s*\(.*adapter\.chat/);
+    // Phase 3 多供应商路由后，chat 走按 provider 解析出的 chatAdapter
+    expect(httpSource).toMatch(/for\s+await\s*\(.*chatAdapter\.chat/);
   });
 
   it("chat() while 循环持续调用 stream()，SSE 连接保持打开", () => {

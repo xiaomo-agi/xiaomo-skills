@@ -8,8 +8,8 @@
  *   cc-mp status
  */
 
-import { execSync } from "child_process";
-import { mkdirSync, writeFileSync, existsSync, appendFileSync } from "fs";
+import { execSync, spawn } from "child_process";
+import { mkdirSync, writeFileSync, existsSync, appendFileSync, openSync, closeSync } from "fs";
 import { homedir } from "os";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
@@ -23,6 +23,8 @@ import {
   killPortProcess,
   checkCloudflared,
   checkCCAvailable,
+  checkCodexAvailable,
+  decideStartupMode,
   getCloudflaredInstallHint,
 } from "./platform.js";
 import qrcode from "qrcode-terminal";
@@ -32,7 +34,10 @@ import { startScheduler, stopScheduler, type Task } from "./scheduler.js";
 import { adapter } from "./adapters/index.js";
 import { CloudflareProvider } from "./tunnel-provider.js";
 import { TunnelManager } from "./tunnel-manager.js";
-import { loadPublicUrl, loadEnvFile } from "./env-loader.js";
+import { loadPublicUrl, loadEnvFile, loadClaudeSettingsEnv } from "./env-loader.js";
+import { listProcesses, registerSelf, unregisterSelf, resolveTarget, killEntry } from "./process-registry.js";
+import { serviceCommand } from "./daemon/service-cli.js";
+import { forbiddenWorkdirReason } from "./workdir-guard.js";
 
 const PORT = process.env.PORT || 18080;
 const WORKER_URL = process.env.WORKER_URL || "https://api.mycc.dev";
@@ -66,18 +71,155 @@ async function main() {
 
   switch (command) {
     case "start":
-      await startServer(args);
+      if (args.includes("-d") || args.includes("--daemon")) {
+        startDetached(args.slice(1));
+        exitCli();
+      } else {
+        await startServer(args);
+      }
       break;
     case "status":
-      console.log("TODO: 显示状态");
+      await showStatus();
+      exitCli();
+      break;
+    case "ps":
+      showProcesses();
+      exitCli();
+      break;
+    case "kill":
+      await killCommand(args[1]);
+      exitCli();
+      break;
+    case "stop":
+      await stopAll();
+      exitCli();
+      break;
+    case "restart":
+      await stopAll();
+      startDetached(args.slice(1));
+      exitCli();
+      break;
+    case "service":
+      await serviceCommand(args[1], args.slice(2));
+      exitCli();
       break;
     case "help":
     default:
       showHelp();
+      exitCli();
   }
 }
 
+/**
+ * CLI 短命令跑完必须显式退出：模块级 import 的 adapter 在构造时就起了
+ * 清理定时器（setInterval），不退出的话事件循环永远不空，命令会挂死。
+ */
+function exitCli(): void {
+  process.exit(process.exitCode ?? 0);
+}
+
+/**
+ * status 子命令：探测本机后端的 /health 接口（无需配对 token）。
+ * 后端运行中 → 打印端口/主机名/web 配对状态，退出码 0；
+ * 无响应 → 提示未运行，退出码 1（脚本/watchdog 可以直接用退出码判断）。
+ */
+async function showStatus(): Promise<void> {
+  const url = `http://127.0.0.1:${PORT}/health`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    const data = (await res.json()) as { status?: string; paired?: boolean; hostname?: string };
+    if (data.status !== "ok") throw new Error(`health 返回异常: ${JSON.stringify(data)}`);
+    console.log(chalk.green(`✓ 后端运行中 (端口 ${PORT})`));
+    console.log(`  主机: ${data.hostname ?? "未知"}`);
+    console.log(`  web 配对: ${data.paired ? "已配对" : "未配对"}`);
+    const entries = listProcesses();
+    if (entries.length > 0) {
+      console.log(`  进程: ${entries.map((e) => `${e.id}(pid ${e.pid})`).join(", ")}`);
+    }
+  } catch {
+    console.log(chalk.red(`✗ 后端未运行（${url} 无响应）`));
+    process.exitCode = 1;
+  }
+}
+
+/** ps 子命令：列出注册表里存活的后端进程 */
+function showProcesses(): void {
+  const entries = listProcesses();
+  if (entries.length === 0) {
+    console.log("没有正在运行的 mycc 后端进程。");
+    return;
+  }
+  console.log(`${"序号".padEnd(4)} ${"ID".padEnd(6)} ${"PID".padEnd(8)} ${"端口".padEnd(6)} ${"启动时间".padEnd(26)} 工作目录`);
+  entries.forEach((e, i) => {
+    const uptimeMin = Math.round((Date.now() - Date.parse(e.startedAt)) / 60000);
+    console.log(
+      `${String(i + 1).padEnd(4)} ${e.id.padEnd(6)} ${String(e.pid).padEnd(8)} ${String(e.port).padEnd(6)} ${`${e.startedAt}（${uptimeMin} 分钟前）`.padEnd(26)} ${e.cwd}`
+    );
+  });
+}
+
+/** kill 子命令：按短 id / pid / ps 序号干掉指定后端进程 */
+async function killCommand(target?: string): Promise<void> {
+  if (!target) {
+    console.log("用法: mycc kill <id|pid|序号>（先用 mycc ps 查看）");
+    process.exitCode = 1;
+    return;
+  }
+  const entry = resolveTarget(target);
+  if (!entry) {
+    console.log(chalk.red(`找不到目标 "${target}"，用 mycc ps 查看正在运行的进程。`));
+    process.exitCode = 1;
+    return;
+  }
+  const outcome = await killEntry(entry);
+  const desc = { terminated: "已优雅退出", killed: "超时后已强制终止", gone: "本来就已退出" }[outcome];
+  console.log(chalk.green(`✓ 进程 ${entry.id}(pid ${entry.pid}) ${desc}`));
+}
+
+/** stop 子命令：停掉所有注册的后端进程；注册表为空时兜底清理端口 */
+async function stopAll(): Promise<void> {
+  const entries = listProcesses();
+  if (entries.length === 0) {
+    console.log("注册表中没有运行中的后端，按端口兜底清理...");
+    await killPortProcess(Number(PORT));
+    console.log(chalk.green(`✓ 端口 ${PORT} 已清理`));
+    return;
+  }
+  for (const entry of entries) {
+    const outcome = await killEntry(entry);
+    const desc = { terminated: "已优雅退出", killed: "超时后已强制终止", gone: "本来就已退出" }[outcome];
+    console.log(chalk.green(`✓ 进程 ${entry.id}(pid ${entry.pid}) ${desc}`));
+  }
+}
+
+/**
+ * start -d / restart：以守护方式启动——spawn 一个脱离进程树的子进程跑
+ * `start`，日志追加到 .claude/skills/mycc/mycc.log，父进程立即返回。
+ * 取代 SKILL.md 里手拼的 `nohup ... & disown`。
+ */
+function startDetached(passThroughArgs: string[]): void {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const scriptsDir = dirname(__dirname);
+  const logFile = join(dirname(scriptsDir), "mycc.log");
+  const tsxBin = join(scriptsDir, "node_modules", ".bin", "tsx");
+  const cleanArgs = passThroughArgs.filter((a) => a !== "-d" && a !== "--daemon");
+
+  appendFileSync(logFile, `\n=== ${new Date().toISOString()} mycc start（守护模式） ===\n`);
+  const out = openSync(logFile, "a");
+  const child = spawn(tsxBin, [join(scriptsDir, "src", "index.ts"), "start", ...cleanArgs], {
+    detached: true,
+    stdio: ["ignore", out, out],
+    cwd: process.cwd(),
+  });
+  child.unref();
+  closeSync(out);
+  console.log(chalk.green(`✓ 后端已在后台启动 (pid ${child.pid})`));
+  console.log(chalk.gray(`  日志: ${logFile}`));
+  console.log(chalk.gray(`  状态: mycc status / mycc ps`));
+}
+
 async function startServer(args: string[]) {
+  loadClaudeSettingsEnv();
   console.log(chalk.cyan("\n=== CC 小程序本地后端 ===\n"));
 
   // 检测版本更新（静默，不阻塞）
@@ -87,15 +229,28 @@ async function startServer(args: string[]) {
   console.log(chalk.gray("检查端口占用..."));
   await killPortProcess(Number(PORT));
 
-  // 检查 CC 是否可用
+  // 登记进程注册表（mycc ps/kill/stop 的数据源），退出时注销
+  const registryEntry = registerSelf(Number(PORT), process.cwd());
+  process.on("exit", () => unregisterSelf(registryEntry.id));
+
+  // 检查 CC / Codex 是否可用：两者都不可用才拒绝启动
   console.log("检查 Claude Code CLI...");
   const ccAvailable = await checkCCAvailable();
-  if (!ccAvailable) {
-    console.error(chalk.red("错误: Claude Code CLI 未安装或不可用"));
-    console.error("请先安装: npm install -g @anthropic-ai/claude-code");
+  const codexAvailable = ccAvailable ? false : await checkCodexAvailable();
+  const startupMode = decideStartupMode(ccAvailable, codexAvailable);
+  if (!startupMode.ok) {
+    console.error(chalk.red("错误: Claude Code CLI 与 Codex CLI 均未安装或不可用"));
+    console.error("请至少安装其一:");
+    console.error("  Claude Code: npm install -g @anthropic-ai/claude-code");
+    console.error("  Codex:       npm install -g @openai/codex");
     process.exit(1);
   }
-  console.log(chalk.green("✓ Claude Code CLI 可用\n"));
+  if (startupMode.mode === "codex-only") {
+    console.warn(chalk.yellow("⚠ Claude Code CLI 不可用，仅 codex 模式启动"));
+    console.warn(chalk.yellow("  /chat 请求需显式传 provider=\"codex\"，默认 claude 通道将报错\n"));
+  } else {
+    console.log(chalk.green("✓ Claude Code CLI 可用\n"));
+  }
 
   // 获取 scripts 目录的父目录（跨平台兼容）
   // 使用 fileURLToPath 确保 Windows/Linux/macOS 都能正确解析
@@ -147,6 +302,13 @@ async function startServer(args: string[]) {
       console.log(chalk.yellow("⚠️  未检测到 .claude/ 或 CLAUDE.md，使用当前目录"));
       console.log(chalk.yellow("   如果 hooks 不生效，请用 --cwd 指定项目根目录\n"));
     }
+  }
+  // 工作目录红线：根目录/Home 根/系统目录直接拒绝启动，防止 Agent 文件操作裸奔
+  const forbidden = forbiddenWorkdirReason(cwd);
+  if (forbidden) {
+    console.error(chalk.red(`错误: ${forbidden}`));
+    console.error("请用 --cwd 指定具体的项目目录。");
+    process.exit(1);
   }
   console.log(`工作目录: ${cwd}\n`);
 
@@ -623,21 +785,29 @@ function showHelp() {
 ${chalk.cyan("CC 小程序本地后端")}
 
 ${chalk.yellow("用法:")}
-  cc-mp start [选项]    启动后端服务
-  cc-mp status          查看状态
-  cc-mp help            显示帮助
+  mycc start [选项]     前台启动后端服务
+  mycc start -d         后台启动（守护模式，日志写 mycc.log）
+  mycc stop             停止所有后端进程（优雅退出，超时强杀）
+  mycc restart          停止后以守护模式重新启动
+  mycc status           探测 /health 查看运行状态
+  mycc ps               列出注册的后端进程
+  mycc kill <id|pid|序号>  干掉指定进程（先用 ps 查看）
+  mycc service <子命令>  OS 托管服务（开机自启+崩溃自动重启，mycc service help 看详情）
+  mycc help             显示帮助
 
 ${chalk.yellow("选项:")}
+  -d, --daemon          后台启动（脱离当前进程树）
   --cwd <目录>          指定工作目录 (默认: 当前目录)
   --reset               重置设备配置，重新生成连接码和配对码
 
 ${chalk.yellow("环境变量:")}
   PORT                  HTTP 服务端口 (默认: 18080)
+  MYCC_DATA_DIR         运行时状态目录（默认跟随代码位置）
 
 ${chalk.yellow("示例:")}
-  cc-mp start
-  cc-mp start --cwd /path/to/project
-  cc-mp start --reset   # 重置配置，需要重新配对
+  mycc start -d
+  mycc start --cwd /path/to/project
+  mycc start --reset    # 重置配置，需要重新配对
 `);
 }
 

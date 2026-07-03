@@ -17,6 +17,14 @@ import {
   buildMarkdownCard,
   normalizeFeishuMarkdownLinks,
 } from "./feishu-streaming.js";
+import { summarizeToolInput } from "./tool-summary.js";
+
+/**
+ * 逐事件调试日志开关（MYCC_DEBUG=1 或 true 时开启）。
+ * 这些日志每条消息/事件都会打一批，默认关闭以免 mycc.log 刷屏。
+ */
+const DEBUG = process.env.MYCC_DEBUG === "1" || process.env.MYCC_DEBUG === "true";
+const debugLog = (...args: unknown[]) => { if (DEBUG) console.log(...args); };
 
 /**
  * 飞书通道配置
@@ -40,6 +48,8 @@ export interface FeishuChannelConfig {
   showToolUse?: boolean;
   /** 通道标识（用于日志区分，如 A/B/C） */
   label?: string;
+  /** 是否使用流式卡片（CardKit API），默认 true。设为 false 降级为静态卡片 */
+  streamingCards?: boolean;
 }
 
 /**
@@ -52,6 +62,43 @@ interface FeishuUploadResponse {
     image_key: string;
   };
 }
+
+interface FeishuReplyTarget {
+  receiveId: string;
+  receiveIdType: "open_id" | "chat_id";
+}
+
+/**
+ * 单条消息的会话上下文（多会话隔离的核心）
+ *
+ * scope 规则（参考 lark-coding-agent-bridge 的设计）：
+ * - 私聊 / 普通群：scope = chatId（整个聊天共享一个会话）
+ * - 话题群：scope = `${chatId}:${threadId}`（每个话题独立会话）
+ * - 群模式查询失败时保守回退 chatId，宁可不拆分也不能把会话搞串
+ */
+export interface FeishuMessageContext {
+  scope: string;
+  chatId?: string;
+  chatType?: string;
+  threadId?: string;
+  messageId?: string;
+  senderId?: string;
+  mentions?: Array<{ id: any; id_type?: string; name?: string; key?: string }>;
+}
+
+export type FeishuMessageHandler = (
+  message: string,
+  images?: Array<{ data: string; mediaType: string }>,
+  files?: Array<{ filePath: string; fileName: string }>,
+  messageId?: string,
+  ctx?: FeishuMessageContext,
+) => void;
+
+/** 卡片按钮点击回调：value 是按钮上带的载荷，ctx 已解析好 scope（含话题群反查） */
+export type FeishuCardActionHandler = (
+  value: Record<string, unknown>,
+  ctx: FeishuMessageContext,
+) => void | Promise<void>;
 
 /**
  * 飞书消息通道
@@ -71,23 +118,44 @@ export class FeishuChannel implements MessageChannel {
   // WebSocket 相关
   private wsClient: Lark.WSClient | null = null;
   private eventDispatcher: Lark.EventDispatcher | null = null;
-  private messageCallback: ((message: string, images?: Array<{ data: string; mediaType: string }>, files?: Array<{ filePath: string; fileName: string }>, messageId?: string) => void) | null = null;
+  private messageCallback: FeishuMessageHandler | null = null;
+  private cardActionCallback: FeishuCardActionHandler | null = null;
+  private wsWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private wsRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  private isWebSocketStopped = false;
+  private isWebSocketStarting = false;
+  private readonly WS_RESTART_DELAY_MS = 30_000;
+  private readonly WS_WATCHDOG_INTERVAL_MS = 60_000;
+  private readonly WS_RECONNECT_STALE_MS = 3 * 60_000;
 
   // 消息合并缓冲（解决同时发图+文字时图片被并发锁丢弃的问题）
-  private messageBuffer: Array<{ text: string; images?: Array<{ data: string; mediaType: string }>; files?: Array<{ filePath: string; fileName: string }>; messageId?: string }> = [];
-  private bufferTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastSenderId: string | null = null;
+  // 按 scope+发送者 分桶，不同群/话题的消息互不干扰
+  private messageBuffers = new Map<string, {
+    items: Array<{ text: string; images?: Array<{ data: string; mediaType: string }>; files?: Array<{ filePath: string; fileName: string }>; messageId?: string }>;
+    timer: ReturnType<typeof setTimeout> | null;
+    ctx: FeishuMessageContext;
+  }>();
   private readonly BUFFER_DELAY = 300; // ms，等待后续消息到达
 
-  // 表态相关（"正在输入" emoji）
-  private currentMessageId: string | null = null;
-  private currentReactionId: string | null = null;
+  // 表态相关（"正在输入" emoji），按 messageId 记录，多会话并发时互不覆盖
+  private typingReactions = new Map<string, string>(); // messageId → reactionId
+
+  /** 群模式缓存：chatId → chat_mode（topic/group/p2p），查一次终身缓存 */
+  private chatModes = new Map<string, string>();
 
   /** 最近一次消息的上下文（用于群路由判断） */
   private lastMessageContext: { chatId?: string; mentions?: Array<{ id: string; id_type?: string; name?: string }> } = {};
 
   /** 本 bot 的 open_id（用于群聊@路由判断） */
   private botOpenId: string | null = null;
+
+  // 流式卡片（CardKit API）
+  private streamingSession: FeishuStreamingSession | null = null;
+  private useStreamingCards: boolean;
+  private streamingTextAcc: string = "";
+
+  /** 上一次成功发送卡片消息的时间（发送节流用） */
+  private lastCardSentAt = 0;
 
   /** 日志前缀 */
   private get lp(): string {
@@ -107,6 +175,18 @@ export class FeishuChannel implements MessageChannel {
       verificationToken: process.env.FEISHU_VERIFICATION_TOKEN,
       showToolUse: process.env.FEISHU_SHOW_TOOL_USE === "false" ? false : true, // 默认 true
     };
+
+    // 流式卡片：默认启用，可通过 config 或环境变量关闭
+    this.useStreamingCards = config?.streamingCards !== false
+      && process.env.FEISHU_STREAMING_CARDS !== "false";
+
+    // 如果有凭证，预创建流式会话实例
+    if (this.config.appId && this.config.appSecret && this.useStreamingCards) {
+      this.streamingSession = new FeishuStreamingSession(
+        { appId: this.config.appId, appSecret: this.config.appSecret },
+        (msg: string) => console.log(`${this.lp} ${msg}`)
+      );
+    }
   }
 
   /**
@@ -117,10 +197,10 @@ export class FeishuChannel implements MessageChannel {
   filter(event: SSEEvent): boolean {
     const eventType = event.type as string;
     // 调试：记录所有事件类型（包括被过滤的）
-    console.log(`${this.lp} [FILTER] 收到事件类型: ${eventType}`);
+    debugLog(`${this.lp} [FILTER] 收到事件类型: ${eventType}`);
 
-    const textOnlyTypes = ["text", "content_block_delta", "system", "assistant"];
-    const allTypes = ["text", "content_block_delta", "system", "assistant", "tool_use"];
+    const textOnlyTypes = ["text", "content_block_delta", "system", "assistant", "turn_complete"];
+    const allTypes = ["text", "content_block_delta", "system", "assistant", "turn_complete", "tool_use"];
 
     // 根据配置决定是否显示工具调用
     if (this.config.showToolUse) {
@@ -135,25 +215,25 @@ export class FeishuChannel implements MessageChannel {
    * @param event - SSE 事件
    */
   async send(event: SSEEvent): Promise<void> {
-    // 调试：记录所有事件类型
-    if (event.type) {
-      console.log(`[FeishuChannel] [DEBUG] 收到事件: ${event.type}${event.type === "assistant" ? " (检查 tool_use)" : ""}`);
-    }
-
     // 如果没有配置飞书凭证，静默跳过
     if (!this.config.appId || !this.config.appSecret) {
       return;
     }
 
     // 没有配置接收用户，跳过
-    if (!this.config.receiveUserId) {
+    if (!this.getReplyTarget()) {
+      return;
+    }
+
+    // turn_complete → 关闭当前流式卡片
+    if (event.type === "turn_complete") {
+      await this.closeStreamingCard();
       return;
     }
 
     // 处理 system 事件（提取图片信息）
     if (event.type === "system") {
       const systemEvent = event as Record<string, unknown>;
-      // 检查是否有图片数据
       if ("images" in systemEvent && Array.isArray(systemEvent.images)) {
         const sessionId = String(systemEvent.session_id || "default");
         await this.handleImages(sessionId, systemEvent.images as Array<{ data: string; mediaType: string }>);
@@ -161,114 +241,64 @@ export class FeishuChannel implements MessageChannel {
       return;
     }
 
-    // 处理 tool_use 事件（工具调用）
-    if (event.type === "tool_use") {
-      if (!this.config.showToolUse) {
-        return;
-      }
-      const toolEvent = event as Record<string, unknown>;
-      const toolContent = this.formatToolUse(toolEvent);
-      if (toolContent) {
-        const sessionId = this.extractSessionId(event);
-        await this.sendMessageToFeishu(toolContent, sessionId);
-      }
-      return;
-    }
-
-    // 处理 v2 SDK 的 assistant 事件（包含消息内容）
+    // 提取文本内容
+    let text = "";
     if (event.type === "assistant") {
-      const assistantEvent = event as Record<string, unknown>;
-      console.log(`[FeishuChannel] [DEBUG] assistant 事件完整结构:`, JSON.stringify(assistantEvent).substring(0, 500));
-
-      // 提取消息内容
-      const textParts: string[] = [];
-      const toolCalls: string[] = [];
-
-      if ("message" in assistantEvent && typeof assistantEvent.message === "object") {
-        const message = assistantEvent.message as Record<string, unknown>;
-        if ("content" in message && Array.isArray(message.content)) {
-          console.log(`[FeishuChannel] [DEBUG] assistant.content 有 ${message.content.length} 个 block`);
-          // content 是一个数组，包含多个 block
-          for (const block of message.content) {
-            if (typeof block === "object" && block !== null) {
-              const blockType = (block as any).type;
-              console.log(`[FeishuChannel] [DEBUG] block type: ${blockType}`, JSON.stringify(block).substring(0, 200));
-              if ("type" in block && block.type === "text" && "text" in block) {
-                // 纯文本内容 - 逐条保存
-                textParts.push(String(block.text));
-              } else if ("type" in block && block.type === "tool_use" && this.config.showToolUse) {
-                // 工具调用，格式化显示
-                console.log(`[FeishuChannel] [DEBUG] 找到 tool_use block，showToolUse=${this.config.showToolUse}`);
-                const toolCall = this.formatToolUseBlock(block as Record<string, unknown>);
-                if (toolCall) {
-                  toolCalls.push(toolCall);
-                }
-              }
-            }
-          }
-        } else {
-          console.log(`[FeishuChannel] [DEBUG] assistant.message 没有 content 数组，有字段:`, Object.keys(message));
-        }
-      } else {
-        console.log(`[FeishuChannel] [DEBUG] assistant 事件没有 message 字段，有字段:`, Object.keys(assistantEvent));
+      text = this.extractAssistantText(event);
+      if (text) {
+        console.log(`${this.lp} [assistant] 提取 ${text.length} 字符`);
       }
+    } else if (event.type === "text") {
+      text = String(event.text ?? "");
+    } else if (event.type === "content_block_delta") {
+      const delta = event.delta as { text?: string } | undefined;
+      text = delta?.text ?? "";
+    } else if (event.type === "tool_use") {
+      if (!this.config.showToolUse) return;
+      const toolContent = this.formatToolUse(event);
+      if (toolContent) text = toolContent;
+    }
 
+    if (!text) return;
+
+    // 流式卡片路径
+    if (this.useStreamingCards && this.streamingSession) {
+      await this.streamUpdate(text);
+    } else {
+      // 降级：静态卡片
       const sessionId = this.extractSessionId(event);
-
-      // 按原始顺序交替发送文本和工具调用
-      // 由于 content 数组中的元素已经是按顺序排列的，我们需要重建原始顺序
-      if ("message" in assistantEvent && typeof assistantEvent.message === "object") {
-        const message = assistantEvent.message as Record<string, unknown>;
-        if ("content" in message && Array.isArray(message.content)) {
-          let textIndex = 0;
-          let toolIndex = 0;
-
-          for (const block of message.content) {
-            if (typeof block === "object" && block !== null) {
-              if ("type" in block && block.type === "text" && "text" in block && textIndex < textParts.length) {
-                // 发送文本
-                await this.sendMessageToFeishu(textParts[textIndex], sessionId);
-                textIndex++;
-              } else if ("type" in block && block.type === "tool_use" && this.config.showToolUse && toolIndex < toolCalls.length) {
-                // 发送工具调用
-                console.log(`[FeishuChannel] [DEBUG] 发送工具调用: ${toolCalls[toolIndex].substring(0, 50)}...`);
-                await this.sendMessageToFeishu(toolCalls[toolIndex], sessionId);
-                toolIndex++;
-              }
-            }
-          }
-        }
-      }
-
-      return;
+      await this.sendMessageToFeishu(text, sessionId);
     }
-
-    // 提取文本内容和 session_id
-    const text = this.extractText(event);
-    const sessionId = this.extractSessionId(event);
-
-    if (!text) {
-      return;
-    }
-
-    // 发送消息到飞书（先发送图片，再发送文字）
-    await this.sendMessageToFeishu(text, sessionId);
   }
 
   /**
    * 设置消息接收回调
    * @param callback - 收到飞书消息时的回调函数
    */
-  onMessage(callback: (message: string, images?: Array<{ data: string; mediaType: string }>, files?: Array<{ filePath: string; fileName: string }>, messageId?: string) => void): void {
+  onMessage(callback: FeishuMessageHandler): void {
     this.messageCallback = callback;
   }
 
   /**
-   * 刷新消息缓冲：合并缓冲的多条消息并一次性回调
+   * 设置卡片按钮点击回调
+   * @param callback - 收到 card.action.trigger 事件时的回调函数
+   */
+  onCardAction(callback: FeishuCardActionHandler): void {
+    this.cardActionCallback = callback;
+  }
+
+  /**
+   * 刷新指定分桶的消息缓冲：合并缓冲的多条消息并一次性回调
    * 解决用户同时发图+文字时，图片被并发锁丢弃的问题
    */
-  private flushMessageBuffer(): void {
-    if (this.messageBuffer.length === 0 || !this.messageCallback) return;
+  private flushMessageBuffer(bufferKey: string): void {
+    const buffer = this.messageBuffers.get(bufferKey);
+    if (!buffer || buffer.items.length === 0 || !this.messageCallback) {
+      this.messageBuffers.delete(bufferKey);
+      return;
+    }
+    if (buffer.timer) clearTimeout(buffer.timer);
+    this.messageBuffers.delete(bufferKey);
 
     // 合并所有缓冲的消息
     let mergedText = "";
@@ -276,7 +306,7 @@ export class FeishuChannel implements MessageChannel {
     const mergedFiles: Array<{ filePath: string; fileName: string }> = [];
     let firstMessageId: string | undefined;
 
-    for (const msg of this.messageBuffer) {
+    for (const msg of buffer.items) {
       if (msg.text && msg.text.trim()) {
         mergedText += (mergedText ? "\n" : "") + msg.text.trim();
       }
@@ -285,14 +315,48 @@ export class FeishuChannel implements MessageChannel {
       if (!firstMessageId && msg.messageId) firstMessageId = msg.messageId;
     }
 
-    console.log(`[FeishuChannel] ✓ 合并 ${this.messageBuffer.length} 条消息: ${mergedText ? mergedText.substring(0, 50) : "[图片/文件]"}... [${mergedImages.length} 图, ${mergedFiles.length} 文件]`);
+    console.log(`${this.lp} ✓ 合并 ${buffer.items.length} 条消息 [scope=${buffer.ctx.scope}]: ${mergedText ? mergedText.substring(0, 50) : "[图片/文件]"}... [${mergedImages.length} 图, ${mergedFiles.length} 文件]`);
 
-    this.messageCallback(mergedText, mergedImages.length > 0 ? mergedImages : undefined, mergedFiles.length > 0 ? mergedFiles : undefined, firstMessageId);
+    this.messageCallback(
+      mergedText,
+      mergedImages.length > 0 ? mergedImages : undefined,
+      mergedFiles.length > 0 ? mergedFiles : undefined,
+      firstMessageId,
+      { ...buffer.ctx, messageId: firstMessageId ?? buffer.ctx.messageId },
+    );
+  }
 
-    // 清空缓冲
-    this.messageBuffer = [];
-    this.lastSenderId = null;
-    this.bufferTimer = null;
+  /**
+   * 计算消息的会话 scope：
+   * 话题群按 `${chatId}:${threadId}` 拆（每话题独立会话），其余按 chatId
+   */
+  private async resolveScope(chatId: string | undefined, chatType: string | undefined, threadId: string | undefined): Promise<string> {
+    if (!chatId) return "__default";
+    if (!threadId || chatType === "p2p") return chatId;
+    const mode = await this.resolveChatMode(chatId);
+    return mode === "topic" ? `${chatId}:${threadId}` : chatId;
+  }
+
+  /** 查询群模式（topic/group/p2p），失败回退 group（保守：不拆分会话） */
+  private async resolveChatMode(chatId: string): Promise<string> {
+    const cached = this.chatModes.get(chatId);
+    if (cached) return cached;
+    try {
+      if (!this.accessToken || Date.now() > this.tokenExpireTime) {
+        this.accessToken = await this.getAccessToken();
+        if (!this.accessToken) return "group";
+      }
+      const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats/${chatId}`, {
+        headers: { "Authorization": `Bearer ${this.accessToken}` },
+      });
+      const data = await res.json() as any;
+      const mode = data?.data?.chat_mode || "group";
+      this.chatModes.set(chatId, mode);
+      console.log(`${this.lp} chat_mode 缓存: ${chatId} → ${mode}`);
+      return mode;
+    } catch {
+      return "group";
+    }
   }
 
   /**
@@ -311,6 +375,8 @@ export class FeishuChannel implements MessageChannel {
       return;
     }
 
+    this.accessToken = token;
+
     console.log("[FeishuChannel] ✓ Credentials validated");
     console.log(`[FeishuChannel] Will send to: ${this.config.receiveUserId || "未配置接收用户"}`);
 
@@ -319,6 +385,7 @@ export class FeishuChannel implements MessageChannel {
 
     // 启动 WebSocket 连接（如果配置了）
     if (this.config.connectionMode === "websocket") {
+      this.isWebSocketStopped = false;
       await this.startWebSocket();
     } else {
       console.log("[FeishuChannel] WebSocket disabled (polling mode)");
@@ -329,6 +396,12 @@ export class FeishuChannel implements MessageChannel {
    * 启动 WebSocket 连接
    */
   private async startWebSocket(): Promise<void> {
+    if (this.isWebSocketStopped || this.isWebSocketStarting) {
+      return;
+    }
+
+    this.isWebSocketStarting = true;
+
     try {
       // 创建 Event Dispatcher（只在配置了加密密钥时传入）
       const dispatcherOptions: {
@@ -349,14 +422,14 @@ export class FeishuChannel implements MessageChannel {
         // 消息接收事件
         "im.message.receive_v1": async (data) => {
           try {
-            console.log("[FeishuChannel] [DEBUG] 收到 im.message.receive_v1 事件");
+            debugLog("[FeishuChannel] [DEBUG] 收到 im.message.receive_v1 事件");
             const event = data as any;
             const messageId = event?.message?.message_id;
 
             // 打印发送者 open_id，方便配置 RECEIVE_USER_ID
             const senderId = event?.sender?.sender_id?.open_id || event?.sender?.id?.open_id;
             if (senderId) {
-              console.log(`[FeishuChannel] [DEBUG] 发送者 open_id: ${senderId}`);
+              debugLog(`[FeishuChannel] [DEBUG] 发送者 open_id: ${senderId}`);
             }
 
             // 添加"正在输入"表态（敲键盘 emoji）
@@ -369,35 +442,45 @@ export class FeishuChannel implements MessageChannel {
             // await 解析结果（图片/文件下载是异步的）
             const parsed = await this.parseFeishuMessage(event, messageId);
             if (!parsed || !this.messageCallback) {
-              console.log("[FeishuChannel] [DEBUG] 解析消息内容为空或无回调");
+              debugLog("[FeishuChannel] [DEBUG] 解析消息内容为空或无回调");
               return;
             }
 
             const { text, images, files } = parsed;
             if (!text && !images && !files) {
-              console.log("[FeishuChannel] [DEBUG] 解析消息内容为空");
+              debugLog("[FeishuChannel] [DEBUG] 解析消息内容为空");
               return;
             }
 
-            // 消息合并缓冲：同用户短时间内多条消息合并（文字+图片）
-            if (this.bufferTimer) {
-              clearTimeout(this.bufferTimer);
-              this.bufferTimer = null;
+            // 构造会话上下文（多会话隔离核心：不同群/话题各自独立）
+            const chatId = event?.message?.chat_id as string | undefined;
+            const chatType = event?.message?.chat_type as string | undefined;
+            const threadId = event?.message?.thread_id as string | undefined;
+            const scope = await this.resolveScope(chatId, chatType, threadId);
+            const ctx: FeishuMessageContext = {
+              scope,
+              chatId,
+              chatType,
+              threadId,
+              messageId,
+              senderId,
+              mentions: event?.message?.mentions || [],
+            };
+
+            // 消息合并缓冲：同 scope+同发送者 短时间内多条消息合并（文字+图片）
+            const bufferKey = `${scope}|${senderId || ""}`;
+            let buffer = this.messageBuffers.get(bufferKey);
+            if (!buffer) {
+              buffer = { items: [], timer: null, ctx };
+              this.messageBuffers.set(bufferKey, buffer);
             }
+            if (buffer.timer) clearTimeout(buffer.timer);
+            buffer.items.push({ text: text || "", images, files, messageId });
 
-            // 检查是否换人了（不同用户消息不合并）
-            if (this.lastSenderId && this.lastSenderId !== senderId) {
-              // 换人，立即 flush 旧消息
-              this.flushMessageBuffer();
-            }
+            console.log(`${this.lp} ✓ 收到消息（缓冲中, scope=${scope}）: ${text ? text.substring(0, 50) : images ? "[图片]" : "[文件]"}...`);
 
-            this.lastSenderId = senderId;
-            this.messageBuffer.push({ text: text || "", images, files, messageId });
-
-            console.log(`[FeishuChannel] ✓ 收到消息（缓冲中）: ${text ? text.substring(0, 50) : images ? "[图片]" : "[文件]"}...`);
-
-            this.bufferTimer = setTimeout(() => {
-              this.flushMessageBuffer();
+            buffer.timer = setTimeout(() => {
+              this.flushMessageBuffer(bufferKey);
             }, this.BUFFER_DELAY);
           } catch (err) {
             console.error("[FeishuChannel] 消息处理错误:", err);
@@ -405,7 +488,7 @@ export class FeishuChannel implements MessageChannel {
         },
         // 消息已读事件（忽略）
         "im.message.message_read_v1": async () => {
-          console.log("[FeishuChannel] [DEBUG] 收到 im.message.message_read_v1 事件（忽略）");
+          debugLog("[FeishuChannel] [DEBUG] 收到 im.message.message_read_v1 事件（忽略）");
         },
         // 机器人被添加到群聊事件
         "im.chat.member.bot.added_v1": async (data) => {
@@ -425,7 +508,11 @@ export class FeishuChannel implements MessageChannel {
             console.error("[FeishuChannel] 处理机器人移除事件错误:", err);
           }
         },
-      });
+        // 卡片按钮点击事件（WS 长连接推送，无需公网回调 URL）。
+        // SDK 的 IHandles 类型表里没有这个键，但 register 的 handles Map 按事件
+        // 名字符串分发，运行时完全支持——参考项目同款机制，这里 as any 绕过类型。
+        "card.action.trigger": async (data: any) => this.handleCardActionEvent(data),
+      } as any);
 
       // 创建 WebSocket 客户端
       this.wsClient = new Lark.WSClient({
@@ -438,11 +525,70 @@ export class FeishuChannel implements MessageChannel {
 
       // 启动连接
       await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
+      this.startWebSocketWatchdog();
       console.log("[FeishuChannel] ✓ WebSocket 已启动");
-      console.log("[FeishuChannel] [INFO] 已注册事件: im.message.receive_v1, im.message.message_read_v1, im.chat.member.bot.added_v1, im.chat.member.bot.deleted_v1");
+      console.log("[FeishuChannel] [INFO] 已注册事件: im.message.receive_v1, im.message.message_read_v1, im.chat.member.bot.added_v1, im.chat.member.bot.deleted_v1, card.action.trigger");
     } catch (err) {
-      console.error("[FeishuChannel] ✗ WebSocket 启动失败:", err);
+      console.error("[FeishuChannel] WebSocket start failed:", err);
+      this.scheduleWebSocketRestart("start_failed");
+    } finally {
+      this.isWebSocketStarting = false;
     }
+  }
+
+
+  private startWebSocketWatchdog(): void {
+    if (this.wsWatchdogTimer) {
+      clearInterval(this.wsWatchdogTimer);
+    }
+
+    this.wsWatchdogTimer = setInterval(() => {
+      if (this.isWebSocketStopped || !this.wsClient) {
+        return;
+      }
+
+      const reconnectInfo = (this.wsClient as any).getReconnectInfo?.();
+      const nextConnectTime = reconnectInfo?.nextConnectTime
+        ? new Date(reconnectInfo.nextConnectTime).getTime()
+        : 0;
+
+      if (nextConnectTime > 0 && nextConnectTime < Date.now() - this.WS_RECONNECT_STALE_MS) {
+        console.warn("[FeishuChannel] WebSocket reconnect stale, scheduling restart:", reconnectInfo);
+        this.scheduleWebSocketRestart("reconnect_stale");
+      }
+    }, this.WS_WATCHDOG_INTERVAL_MS);
+
+    (this.wsWatchdogTimer as any).unref?.();
+  }
+
+  private scheduleWebSocketRestart(reason: string): void {
+    if (this.isWebSocketStopped || this.wsRestartTimer) {
+      return;
+    }
+
+    console.warn("[FeishuChannel] WebSocket restart scheduled: " + reason);
+    this.wsRestartTimer = setTimeout(async () => {
+      this.wsRestartTimer = null;
+      if (this.isWebSocketStopped) {
+        return;
+      }
+
+      const oldClient = this.wsClient;
+      this.wsClient = null;
+      this.eventDispatcher = null;
+
+      if (oldClient) {
+        try {
+          await oldClient.close({ force: true } as any);
+        } catch {
+          // Ignore close errors from already-dead sockets.
+        }
+      }
+
+      await this.startWebSocket();
+    }, this.WS_RESTART_DELAY_MS);
+
+    (this.wsRestartTimer as any).unref?.();
   }
 
   /**
@@ -456,6 +602,12 @@ export class FeishuChannel implements MessageChannel {
         chatId: message?.chat_id,
         mentions: message?.mentions || [],
       };
+
+      // [DEBUG] 打印 mention 原始结构，用于排查群@路由问题
+      if (message?.mentions && message.mentions.length > 0) {
+        debugLog(`${this.lp} [DEBUG-MENTION] chatId=${message.chat_id} mentions=${JSON.stringify(message.mentions)}`);
+        debugLog(`${this.lp} [DEBUG-MENTION] this.botOpenId=${this.botOpenId}`);
+      }
 
       // 事件结构: event.sender + event.message（不是 event.event.message）
       if (!message) return null;
@@ -519,11 +671,101 @@ export class FeishuChannel implements MessageChannel {
   }
 
   /**
+   * 处理卡片按钮点击事件（card.action.trigger）。
+   *
+   * 事件里不带 thread_id：话题群需要用 open_message_id 反查卡片所在消息，
+   * 才能把点击路由到正确话题的会话（参考项目 resolveScope 踩过的坑）。
+   * 返回值会作为事件响应回传给飞书，可携带 toast 立即提示点击者。
+   * 业务处理不 await：先让事件快速返回（toast 立刻弹出），处理结果由
+   * 回调自己发消息反馈。
+   */
+  async handleCardActionEvent(data: any): Promise<Record<string, unknown>> {
+    try {
+      const chatId = data?.context?.open_chat_id as string | undefined;
+      const messageId = data?.context?.open_message_id as string | undefined;
+      const senderId = data?.operator?.open_id as string | undefined;
+      let value = data?.action?.value;
+      // 表单提交（如重命名输入卡）：输入框内容在 action.form_value 里，
+      // 挂到 value.form 一起转发，命令层按输入框 name 取值
+      const formValue = data?.action?.form_value;
+      if (formValue && typeof formValue === "object" && value && typeof value === "object") {
+        value = { ...value, form: formValue };
+      }
+
+      if (!value || typeof value !== "object") {
+        debugLog(`${this.lp} [DEBUG] 卡片点击无 value，忽略`);
+        return {};
+      }
+      if (!this.cardActionCallback) {
+        console.warn(`${this.lp} ⚠ 收到卡片点击但未注册回调，忽略`);
+        return {};
+      }
+
+      const mode = chatId ? await this.resolveChatMode(chatId) : "group";
+      let threadId: string | undefined;
+      if (mode === "topic" && messageId) {
+        threadId = await this.lookupMessageThreadId(messageId);
+      }
+      const chatType = mode === "p2p" ? "p2p" : "group";
+      const scope = await this.resolveScope(chatId, chatType, threadId);
+      const ctx: FeishuMessageContext = { scope, chatId, chatType, threadId, messageId, senderId };
+
+      console.log(`${this.lp} ✓ 卡片按钮点击: ${JSON.stringify(value).substring(0, 100)} (scope=${scope})`);
+      // then() 里再调回调：同步抛错也进 catch，不影响 toast 响应
+      Promise.resolve()
+        .then(() => this.cardActionCallback!(value as Record<string, unknown>, ctx))
+        .catch((err) => {
+          console.error(`${this.lp} 卡片按钮处理错误:`, err);
+        });
+      return { toast: { type: "info", content: "已收到" } };
+    } catch (err) {
+      console.error(`${this.lp} 卡片按钮事件解析错误:`, err);
+      return {};
+    }
+  }
+
+  /**
+   * 反查消息所在话题的 thread_id（卡片点击事件不带 thread_id，话题群定位 scope 用）。
+   * 查不到时返回 undefined，调用方回退 chatId scope——宁可落到群默认会话，
+   * 也不能让点击静默失败。
+   */
+  private async lookupMessageThreadId(messageId: string): Promise<string | undefined> {
+    try {
+      if (!this.accessToken || Date.now() > this.tokenExpireTime) {
+        this.accessToken = await this.getAccessToken();
+        if (!this.accessToken) return undefined;
+      }
+      const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}`, {
+        headers: { "Authorization": `Bearer ${this.accessToken}` },
+      });
+      const data = await res.json() as any;
+      const threadId = data?.data?.items?.[0]?.thread_id;
+      return typeof threadId === "string" && threadId ? threadId : undefined;
+    } catch (err) {
+      console.warn(`${this.lp} ⚠ 反查消息 thread_id 失败: ${err}`);
+      return undefined;
+    }
+  }
+
+  /**
    * 停止飞书通道
    */
   stop() {
+    this.isWebSocketStopped = true;
+    if (this.wsWatchdogTimer) {
+      clearInterval(this.wsWatchdogTimer);
+      this.wsWatchdogTimer = null;
+    }
+    if (this.wsRestartTimer) {
+      clearTimeout(this.wsRestartTimer);
+      this.wsRestartTimer = null;
+    }
+
     this.accessToken = null;
     this.pendingImages.clear();
+
+    // 关闭流式卡片
+    this.closeStreamingCard().catch(() => {});
 
     // 停止 WebSocket
     if (this.wsClient) {
@@ -537,6 +779,7 @@ export class FeishuChannel implements MessageChannel {
     }
     this.eventDispatcher = null;
     this.messageCallback = null;
+    this.cardActionCallback = null;
   }
 
   /**
@@ -570,19 +813,11 @@ export class FeishuChannel implements MessageChannel {
    */
   private formatToolUse(event: Record<string, unknown>): string {
     try {
-      const name = event.name as string || "unknown";
-      const input = event.input as Record<string, unknown> || {};
-
-      let output = `🔧 使用工具: **${name}**\n`;
-
-      // 格式化输入参数
-      if (Object.keys(input).length > 0) {
-        output += "```\n";
-        output += JSON.stringify(input, null, 2);
-        output += "\n```\n";
-      }
-
-      return output;
+      const name = (event.name as string) || "unknown";
+      // 按工具类型选字段的摘要，替代之前无上限的 JSON 全量 dump
+      // （Write 带整个文件内容时能直接把卡片撑爆）
+      const summary = summarizeToolInput(name, event.input, 200);
+      return `🔧 使用工具: **${name}**${summary ? `\n\`${summary}\`` : ""}\n`;
     } catch (err) {
       console.error("[FeishuChannel] 格式化工具调用失败:", err);
       return "🔧 使用工具（详情解析失败）";
@@ -594,25 +829,104 @@ export class FeishuChannel implements MessageChannel {
    */
   private formatToolUseBlock(block: Record<string, unknown>): string | null {
     try {
-      const name = block.name as string || "unknown";
-      const input = block.input as Record<string, unknown> || {};
-
-      let output = `🔧 **${name}**`;
-
-      // 如果有输入参数，简要显示
-      if (Object.keys(input).length > 0) {
-        const inputStr = JSON.stringify(input);
-        if (inputStr.length > 100) {
-          output += ` ${inputStr.substring(0, 100)}...`;
-        } else {
-          output += ` ${inputStr}`;
-        }
-      }
-
-      return output;
+      const name = (block.name as string) || "unknown";
+      // 按工具类型选字段的单行摘要，替代之前裸 JSON.stringify 截 100 字符
+      const summary = summarizeToolInput(name, block.input);
+      return `🔧 **${name}**${summary ? ` ${summary}` : ""}`;
     } catch (err) {
       console.error("[FeishuChannel] 格式化工具调用失败:", err);
       return "🔧 工具调用（详情解析失败）";
+    }
+  }
+
+  /**
+   * 从 assistant 事件提取所有 text + tool_use，拼接为完整文本
+   */
+  private extractAssistantText(event: Record<string, unknown>): string {
+    const parts: string[] = [];
+    if ("message" in event && typeof event.message === "object") {
+      const message = event.message as any;
+      if (message.content && Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (block.type === "text") {
+            parts.push(String(block.text));
+          } else if (block.type === "tool_use" && this.config.showToolUse) {
+            const formatted = this.formatToolUseBlock(block as Record<string, unknown>);
+            if (formatted) parts.push(`\n${formatted}\n`);
+          }
+        }
+      }
+    }
+    return parts.join("\n");
+  }
+
+  /**
+   * 流式更新卡片（累积文本 + 调 CardKit API）
+   * CardKit 不可用时自动降级为静态卡片
+   */
+  private async streamUpdate(text: string): Promise<void> {
+    if (!this.streamingSession) return;
+
+    const target = this.getReplyTarget();
+    if (!target) return;
+
+    try {
+      // 如果有待发送的图片，先发图片再创建流式卡片
+      const imagesToSend: string[] = [];
+      for (const [sid, imageKey] of this.pendingImages.entries()) {
+        imagesToSend.push(imageKey);
+        this.pendingImages.delete(sid);
+      }
+      for (const imageKey of imagesToSend) {
+        await this.sendImageMessage(target.receiveId, imageKey, target.receiveIdType);
+      }
+
+      // 如果当前没有活跃的流式卡片，创建新的
+      if (!this.streamingSession.isActive()) {
+        console.log(`${this.lp} [Streaming] 创建流式卡片...`);
+        await this.streamingSession.start(
+          target.receiveId,
+          target.receiveIdType
+        );
+        this.streamingTextAcc = "";
+      }
+
+      // 按事件累积：send() 按事件类型提取出的是"本事件的文本片段"，
+      // 在这里追加成全量快照再交给流式会话（update 是快照语义，后写覆盖）。
+      // 以前是覆盖赋值 + 会话内 includes() 启发式拼接，AI 输出重复内容时会被误判为旧文本丢掉
+      this.streamingTextAcc += text;
+
+      // 发送到飞书（内部有节流，100ms 内多次调用自动合并）
+      await this.streamingSession.update(this.streamingTextAcc);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`${this.lp} [Streaming] 流式卡片不可用，降级为静态卡片: ${msg}`);
+      this.useStreamingCards = false;
+
+      // 用当前累积文本发一张静态卡片（不丢内容）
+      try {
+        await this.sendMessageToFeishu(this.streamingTextAcc || text, undefined);
+      } catch {
+        // 静默
+      }
+    }
+  }
+
+  /**
+   * 关闭当前流式卡片（公开方法，外部可调用）
+   */
+  async closeStreamingCard(): Promise<void> {
+    if (!this.streamingSession || !this.streamingSession.isActive()) return;
+    try {
+      // 确保最后一段文本已发送
+      if (this.streamingTextAcc) {
+        await this.streamingSession.update(this.streamingTextAcc);
+      }
+      await this.streamingSession.close();
+      this.streamingTextAcc = "";
+      console.log(`${this.lp} [Streaming] 卡片已关闭`);
+    } catch (err) {
+      console.warn(`${this.lp} [Streaming] 关闭失败:`, err);
     }
   }
 
@@ -702,7 +1016,7 @@ export class FeishuChannel implements MessageChannel {
       // 如果有 messageId，使用 messageResource API 下载
       // 对于用户发送的图片，image_key 可以直接作为 file_key 使用
       if (messageId) {
-        console.log(`[FeishuChannel] [DEBUG] Using messageResource API with image_key as file_key`);
+        debugLog(`[FeishuChannel] [DEBUG] Using messageResource API with image_key as file_key`);
 
         const resourceResponse = await fetch(
           `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${imageKey}?type=image`,
@@ -728,7 +1042,7 @@ export class FeishuChannel implements MessageChannel {
 
       // 没有 messageId 的情况：尝试直接下载
       // 注意：这只对机器人自己上传的图片有效（通过 im/v1/images 上传）
-      console.log(`[FeishuChannel] [DEBUG] No messageId, trying direct image download (only works for bot-uploaded images)`);
+      debugLog(`[FeishuChannel] [DEBUG] No messageId, trying direct image download (only works for bot-uploaded images)`);
       const directResponse = await fetch(`https://open.feishu.cn/open-apis/im/v1/images/${imageKey}`, {
         method: "GET",
         headers: {
@@ -757,7 +1071,6 @@ export class FeishuChannel implements MessageChannel {
    */
   private async sendMessageToFeishu(text: string, sessionId?: string): Promise<boolean> {
     try {
-      // 获取访问令牌（如果需要）
       if (!this.accessToken || Date.now() > this.tokenExpireTime) {
         this.accessToken = await this.getAccessToken();
         if (!this.accessToken) {
@@ -765,35 +1078,50 @@ export class FeishuChannel implements MessageChannel {
         }
       }
 
-      const userId = this.config.receiveUserId!;
+      const target = this.getReplyTarget();
+      if (!target) {
+        return false;
+      }
+      const userId = target.receiveId;
 
-      // 如果有待发送的图片，先发送图片
       if (sessionId && this.pendingImages.has(sessionId)) {
         const imageKey = this.pendingImages.get(sessionId)!;
-        const imageSent = await this.sendImageMessage(userId, imageKey);
+        const imageSent = await this.sendImageMessage(userId, imageKey, target.receiveIdType);
         if (imageSent) {
-          // 图片发送成功后，移除记录
           this.pendingImages.delete(sessionId);
         }
       }
 
-      const receiveIdType = this.config.receiveIdType || "open_id";
-
-      // 使用 schema 2.0 markdown 卡片（支持代码块、表格、链接等完整 markdown）
       const normalizedText = normalizeFeishuMarkdownLinks(text);
-      return await this.sendMarkdownCardMessage(userId, normalizedText);
+      return await this.sendMarkdownCardMessage(userId, normalizedText, target.receiveIdType);
     } catch (error) {
-      console.error("[FeishuChannel] ✗ Send error:", error);
+      console.error("[FeishuChannel] Send error:", error);
       return false;
     }
   }
 
   /**
-   * 发送交互卡片消息
+   * 发送节流：飞书 im 消息接口有 QPS 限制，连续发送时保持 1 秒最小间隔。
+   * 之前是每次发送成功后无条件 sleep(1000)——降级模式逐条发消息时每条都
+   * 白等 1 秒，单条消息也要多挂 1 秒才返回；改成只在间隔不足时补齐等待。
    */
-  private async sendInteractiveCard(userId: string, card: any): Promise<boolean> {
+  private async throttleCardSend(): Promise<void> {
+    const wait = this.lastCardSentAt + 1000 - Date.now();
+    if (wait > 0) await sleep(wait);
+    this.lastCardSentAt = Date.now();
+  }
+
+  /**
+   * 发送交互卡片消息（公开：命令层发带按钮的卡片用）
+   */
+  async sendInteractiveCard(userId: string, card: any, idType?: "open_id" | "chat_id"): Promise<boolean> {
     try {
-      const receiveIdType = this.config.receiveIdType || "open_id";
+      if (!this.accessToken || Date.now() > this.tokenExpireTime) {
+        this.accessToken = await this.getAccessToken();
+        if (!this.accessToken) return false;
+      }
+      const receiveIdType = idType || this.config.receiveIdType || "open_id";
+      await this.throttleCardSend();
 
       const responseBody = {
         receive_id: userId,
@@ -813,7 +1141,6 @@ export class FeishuChannel implements MessageChannel {
       const result = await response.json();
       if (result.code === 0) {
         console.log(`[FeishuChannel] ✓ Sent interactive card`);
-        await sleep(1000);
         return true;
       } else {
         console.error("[FeishuChannel] ✗ Send failed:", result.msg);
@@ -829,9 +1156,10 @@ export class FeishuChannel implements MessageChannel {
    * 发送 schema 2.0 markdown 卡片消息
    * 完整支持代码块、表格、链接、加粗等 markdown 语法
    */
-  private async sendMarkdownCardMessage(userId: string, text: string): Promise<boolean> {
+  private async sendMarkdownCardMessage(userId: string, text: string, idType?: "open_id" | "chat_id"): Promise<boolean> {
     try {
-      const receiveIdType = this.config.receiveIdType || "open_id";
+      const receiveIdType = idType || this.config.receiveIdType || "open_id";
+      await this.throttleCardSend();
       const card = buildMarkdownCard(text);
 
       const responseBody = {
@@ -857,7 +1185,6 @@ export class FeishuChannel implements MessageChannel {
         console.log(
           `[FeishuChannel] ✓ Sent card: ${text.substring(0, 30)}${text.length > 30 ? "..." : ""}`
         );
-        await sleep(1000);
         return true;
       } else {
         console.error("[FeishuChannel] ✗ Send card failed:", result.msg);
@@ -872,9 +1199,9 @@ export class FeishuChannel implements MessageChannel {
   /**
    * 发送图片消息到飞书
    */
-  private async sendImageMessage(userId: string, imageKey: string): Promise<boolean> {
+  private async sendImageMessage(userId: string, imageKey: string, idType?: "open_id" | "chat_id"): Promise<boolean> {
     try {
-      const receiveIdType = this.config.receiveIdType || "open_id";
+      const receiveIdType = idType || this.config.receiveIdType || "open_id";
       const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`, {
         method: "POST",
         headers: {
@@ -1066,7 +1393,7 @@ export class FeishuChannel implements MessageChannel {
 
   /**
    * 添加"正在输入"表态（敲键盘 emoji）
-   * 参照 C:\Users\wannago\.openclaw\extensions\feishu\src\typing.ts
+   * 参照 openclaw 飞书扩展的 typing.ts 实现
    * @returns reactionId - 表态 ID，用于后续删除
    */
   private async addTypingIndicator(messageId: string): Promise<string | null> {
@@ -1096,11 +1423,10 @@ export class FeishuChannel implements MessageChannel {
 
       const result = await response.json();
       if (result.code === 0 && result.data?.reaction_id) {
-        // 保存 messageId 和 reactionId
-        this.currentMessageId = messageId;
-        this.currentReactionId = result.data.reaction_id;
-        console.log(`[FeishuChannel] ✓ 已添加正在输入表态 (${this.currentReactionId})`);
-        return this.currentReactionId;
+        // 按 messageId 记录，多会话并发时互不覆盖
+        this.typingReactions.set(messageId, result.data.reaction_id);
+        console.log(`[FeishuChannel] ✓ 已添加正在输入表态 (${result.data.reaction_id})`);
+        return result.data.reaction_id;
       }
       // 静默失败 - 表态不是关键功能
       return null;
@@ -1135,14 +1461,83 @@ export class FeishuChannel implements MessageChannel {
   }
 
   /**
-   * 移除当前的"正在输入"表态（公共方法）
+   * 移除"正在输入"表态（公共方法）
+   * @param messageId - 指定则只清该消息的表态；不传则清全部（兼容旧调用）
    */
-  async clearTypingIndicator(): Promise<void> {
-    if (this.currentMessageId && this.currentReactionId) {
-      await this.removeTypingIndicator(this.currentMessageId, this.currentReactionId);
-      this.currentMessageId = null;
-      this.currentReactionId = null;
+  async clearTypingIndicator(messageId?: string): Promise<void> {
+    const targets = messageId
+      ? (this.typingReactions.has(messageId) ? [[messageId, this.typingReactions.get(messageId)!] as const] : [])
+      : [...this.typingReactions.entries()];
+    for (const [mid, rid] of targets) {
+      await this.removeTypingIndicator(mid, rid);
+      this.typingReactions.delete(mid);
+    }
+    if (targets.length > 0) {
       console.log("[FeishuChannel] ✓ 已移除正在输入表态");
+    }
+  }
+
+  /**
+   * 回复指定消息（markdown 卡片）：回复会自动落在正确的群和话题里
+   * 多会话模式下优先用这个而不是全局 getReplyTarget()
+   */
+  async sendMarkdownReply(messageId: string, text: string): Promise<boolean> {
+    try {
+      if (!this.accessToken || Date.now() > this.tokenExpireTime) {
+        this.accessToken = await this.getAccessToken();
+        if (!this.accessToken) return false;
+      }
+      const card = buildMarkdownCard(normalizeFeishuMarkdownLinks(text));
+      const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/reply`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${this.accessToken}`,
+          "Content-Type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify({ msg_type: "interactive", content: JSON.stringify(card) }),
+      });
+      const result = await response.json();
+      if (result.code === 0) {
+        console.log(`${this.lp} ✓ 已回复消息 ${messageId}: ${text.substring(0, 30)}...`);
+        return true;
+      }
+      console.error(`${this.lp} ✗ 回复失败:`, result.msg);
+      return false;
+    } catch (error) {
+      console.error(`${this.lp} ✗ 回复出错:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * 回复指定消息（预构建的交互卡片，可带按钮）：回复自动落在正确的群和话题里。
+   * 和 sendMarkdownReply 的区别：这里不做 markdown 包装，卡片由调用方构建
+   * （card-actions.ts 的按钮卡片）。
+   */
+  async sendCardReply(messageId: string, card: Record<string, unknown>): Promise<boolean> {
+    try {
+      if (!this.accessToken || Date.now() > this.tokenExpireTime) {
+        this.accessToken = await this.getAccessToken();
+        if (!this.accessToken) return false;
+      }
+      const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/reply`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${this.accessToken}`,
+          "Content-Type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify({ msg_type: "interactive", content: JSON.stringify(card) }),
+      });
+      const result = await response.json();
+      if (result.code === 0) {
+        console.log(`${this.lp} ✓ 已回复按钮卡片 ${messageId}`);
+        return true;
+      }
+      console.error(`${this.lp} ✗ 按钮卡片回复失败:`, result.msg);
+      return false;
+    } catch (error) {
+      console.error(`${this.lp} ✗ 按钮卡片回复出错:`, error);
+      return false;
     }
   }
 
@@ -1155,6 +1550,27 @@ export class FeishuChannel implements MessageChannel {
       { appId: this.config.appId, appSecret: this.config.appSecret },
       (msg) => console.log(msg)
     );
+  }
+
+  /**
+   * Get the best reply target for the latest inbound message.
+   */
+  getReplyTarget(): FeishuReplyTarget | null {
+    if (this.lastMessageContext.chatId) {
+      return {
+        receiveId: this.lastMessageContext.chatId,
+        receiveIdType: "chat_id",
+      };
+    }
+
+    if (!this.config.receiveUserId) {
+      return null;
+    }
+
+    return {
+      receiveId: this.config.receiveUserId,
+      receiveIdType: this.config.receiveIdType || "open_id",
+    };
   }
 
   /**
@@ -1207,192 +1623,6 @@ export class FeishuChannel implements MessageChannel {
     }
   }
 
-  /**
-   * 解析 Markdown 表格为飞书交互卡片表格格式
-   * @returns 包含 beforeTable、afterTable 和表格数据的对象，如果没有表格则返回 null
-   */
-  private parseMarkdownTable(text: string): { beforeTable: string; afterTable: string; headers: string[]; rows: string[][] } | null {
-    // 检测表格：查找包含 | 的连续行，至少 2 行（表头 + 分隔线）
-    const lines = text.split("\n");
-    let tableStart = -1;
-    let tableEnd = -1;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      // 表格行特征：以 | 开头或包含 |
-      if (line.startsWith("|") || (line.includes("|") && line.includes("|"))) {
-        if (tableStart === -1) {
-          tableStart = i;
-        }
-        // 检查下一行是否是分隔线（包含 |---| 或类似的）
-        if (i + 1 < lines.length && lines[i + 1].trim().match(/^\|?[\s\-:]+\|[\s\-:]+\|?/)) {
-          tableEnd = i + 1;
-          // 继续查找表格的后续行
-          for (let j = i + 2; j < lines.length; j++) {
-            const nextLine = lines[j].trim();
-            if (nextLine.startsWith("|") || nextLine.includes("|")) {
-              tableEnd = j;
-            } else {
-              break;
-            }
-          }
-          break;
-        }
-      }
-    }
-
-    if (tableStart === -1 || tableEnd === -1) {
-      return null;
-    }
-
-    // 提取表格前的内容
-    const beforeTable = lines.slice(0, tableStart).join("\n").trim();
-
-    // 提取表格后的内容
-    const afterTable = lines.slice(tableEnd + 1).join("\n").trim();
-
-    // 解析表格数据
-    const tableLines = lines.slice(tableStart, tableEnd + 1);
-    const headers = this.parseTableRow(tableLines[0]);
-    const rows = tableLines.slice(2).map(line => this.parseTableRow(line));
-
-    return { beforeTable, afterTable, headers, rows };
-  }
-
-  /**
-   * 构建飞书交互卡片（带表格）
-   */
-  private buildTableCard(beforeTable: string, headers: string[], rows: string[][], afterTable: string): any {
-    const elements: any[] = [];
-
-    // 表格前的内容（如果有）
-    if (beforeTable) {
-      elements.push({
-        tag: "div",
-        text: {
-          tag: "lark_md",
-          content: beforeTable
-        }
-      });
-    }
-
-    // 飞书表格列定义（使用官方格式）
-    // 为每列生成唯一的 name（英文字母键名）
-    const columnKeys = headers.map((_, i) => `col_${i}`);
-    const tableColumns = headers.map((h, i) => ({
-      name: columnKeys[i],
-      display_name: h,
-      data_type: "text",
-      width: "120px"
-    }));
-
-    // 构建行数据（每行是一个对象，键名必须匹配列的 name）
-    const tableRows = rows.map(row => {
-      const rowObj: any = {};
-      row.forEach((cell, i) => {
-        rowObj[columnKeys[i]] = cell;
-      });
-      return rowObj;
-    });
-
-    // 添加表格元素（使用飞书官方格式）
-    elements.push({
-      tag: "table",
-      columns: tableColumns,
-      rows: tableRows,
-      page_size: 10,
-      row_height: "low"
-    });
-
-    // 表格后的内容（如果有）
-    if (afterTable) {
-      elements.push({
-        tag: "div",
-        text: {
-          tag: "lark_md",
-          content: afterTable
-        }
-      });
-    }
-
-    // 返回完整的交互卡片（添加 header）
-    return {
-      config: {
-        wide_screen_mode: true
-      },
-      header: {
-        title: {
-          tag: "plain_text",
-          content: beforeTable.trim().split("\n").pop() || "数据表格"
-        }
-      },
-      elements
-    };
-  }
-
-  /**
-   * 解析表格行
-   */
-  private parseTableRow(line: string): string[] {
-    // 移除首尾的 |
-    let trimmed = line.trim();
-    if (trimmed.startsWith("|")) {
-      trimmed = trimmed.slice(1);
-    }
-    if (trimmed.endsWith("|")) {
-      trimmed = trimmed.slice(0, -1);
-    }
-
-    // 按 | 分割并清理空白
-    return trimmed.split("|").map(cell => cell.trim());
-  }
-
-  /**
-   * 将 Markdown 表格转换为文本列表格式（飞书兼容）
-   */
-  private convertMarkdownTables(text: string): string {
-    const lines = text.split("\n");
-    const result: string[] = [];
-    let i = 0;
-
-    while (i < lines.length) {
-      const line = lines[i].trim();
-
-      // 检测表格开始
-      if (line.startsWith("|") && i + 1 < lines.length && lines[i + 1].trim().match(/^\|?[\s\-:]+\|/)) {
-        // 解析表头
-        const headers = this.parseTableRow(line);
-
-        // 跳过分隔线
-        i += 2;
-
-        // 解析数据行
-        const rows: string[][] = [];
-        while (i < lines.length && (lines[i].trim().startsWith("|") || lines[i].trim().includes("|"))) {
-          rows.push(this.parseTableRow(lines[i]));
-          i++;
-        }
-
-        // 转换为列表格式
-        result.push("📋 **" + (headers[0] || "表格") + "**");
-        for (const row of rows) {
-          if (row.length > 0) {
-            const rowText = row.map((cell, idx) => {
-              const header = headers[idx] || "";
-              return `${header}: ${cell}`.trim();
-            }).filter(s => s).join(" | ");
-            result.push(`• ${rowText}`);
-          }
-        }
-        result.push(""); // 空行分隔
-      } else {
-        result.push(lines[i]);
-        i++;
-      }
-    }
-
-    return result.join("\n");
-  }
 }
 
 /** sleep 辅助函数 */
