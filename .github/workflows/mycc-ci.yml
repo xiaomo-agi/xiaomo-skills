@@ -6,9 +6,9 @@ name: mycc CI
 
 on:
   push:
-    paths: ["skills/mycc/**", ".github/workflows/mycc-ci.yml"]
+    paths: ["scripts/**", ".github/workflows/mycc-ci.yml"]
   pull_request:
-    paths: ["skills/mycc/**", ".github/workflows/mycc-ci.yml"]
+    paths: ["scripts/**", ".github/workflows/mycc-ci.yml"]
   workflow_dispatch:
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: skills/mycc/scripts
+        working-directory: scripts
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +29,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-          cache-dependency-path: skills/mycc/scripts/package-lock.json
+          cache-dependency-path: scripts/package-lock.json
       - name: 安装依赖
         run: npm ci --no-audit --no-fund
       - name: 类型检查（硬门）
@@ -39,3 +39,4 @@ jobs:
       - name: 全量测试（信息性：网络/时序用例在 CI 环境预期部分失败）
         run: npx vitest run --reporter=dot
         continue-on-error: true
+        timeout-minutes: 8  # Windows 上个别用例会挂住，封顶防止 run 无限拖
