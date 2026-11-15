@@ -14,6 +14,8 @@ import {
   buildMarkdownCard,
   FEISHU_CARD_MAX_BYTES,
   FeishuStreamingSession,
+  markdownCardBlocksToText,
+  type MarkdownCardBlock,
 } from "../src/channels/feishu-streaming.js";
 
 function jsonBytes(text: string): number {
@@ -64,17 +66,127 @@ describe("truncateForFeishuCard", () => {
 });
 
 describe("buildMarkdownCard 截断收口", () => {
+  // 2026-10-31 起 elements[0] 是抹茶抬头条（column_set），正文在第一个 markdown 元素
+  const mdOf = (card: any) => {
+    const direct = card.body.elements.find((e: any) => e.tag === "markdown");
+    if (direct) return direct;
+    // 抬头条是 matcha 底，正文容器是 matcha-bg 底——按底色区分
+    const box = card.body.elements.find(
+      (e: any) => e.tag === "interactive_container" && e.background_style === "matcha-bg"
+    );
+    return box?.elements?.find((e: any) => e.tag === "markdown");
+  };
+
   it("短文本卡片内容不变", () => {
     const card = buildMarkdownCard("正常回复") as any;
-    expect(card.body.elements[0].content).toBe("正常回复");
+    expect(mdOf(card).content).toBe("正常回复");
   });
 
   it("超长文本进卡片前被截断", () => {
     const long = "很长的回复\n".repeat(10000);
     const card = buildMarkdownCard(long) as any;
-    const content = card.body.elements[0].content as string;
+    const content = mdOf(card).content as string;
     expect(jsonBytes(content)).toBeLessThanOrEqual(FEISHU_CARD_MAX_BYTES);
     expect(content).toContain("内容过长");
+  });
+});
+
+describe("buildMarkdownCard blocks 版式（方案A 静态折叠面板）", () => {
+  // 正文容器是 matcha-bg 底；抬头条（interactive_container + matcha 底）不算正文
+  const textBlocksOf = (card: any): string[] =>
+    (card.body.elements as any[])
+      .filter((e) => e.tag === "interactive_container" && e.background_style === "matcha-bg")
+      .flatMap((e) => (e.elements ?? []).map((x: any) => x.content));
+
+  it("含工具调用的 blocks：正文进 markdown 容器、工具调用渲染成 collapsible_panel", () => {
+    const card = buildMarkdownCard([
+      { type: "text", content: "先看一下文件" },
+      {
+        type: "tool",
+        name: "Read",
+        line: "🔧 **Read** /a/b.ts",
+        detail: '```json\n{"file_path": "/a/b.ts"}\n```',
+      },
+      { type: "text", content: "读完了" },
+    ]) as any;
+
+    const panels = (card.body.elements as any[]).filter((e) => e.tag === "collapsible_panel");
+    expect(panels).toHaveLength(1);
+    const panel = panels[0];
+    // 2026-10-30 真卡实测口径：极简结构，收起态标题是短条（不含命令长摘要）
+    expect(panel.header.title).toEqual({ tag: "plain_text", content: "🔧 Read（点开看详情）" });
+    expect(panel.header.vertical_align).toBe("middle");
+    expect(panel.elements[0].tag).toBe("markdown");
+    expect(panel.elements[0].content).toContain("🔧 **Read** /a/b.ts");
+    expect(panel.elements[0].content).toContain("file_path");
+    // 样式属性一律不带（真卡实测 300315 unknown property）
+    for (const forbidden of [
+      "background_style",
+      "background_color",
+      "border_radius",
+      "border",
+      "padding",
+      "vertical_spacing",
+      "expanded_state",
+      "expanded",
+    ]) {
+      expect(panel).not.toHaveProperty(forbidden);
+      expect(panel.header).not.toHaveProperty(forbidden);
+    }
+    // 正文两个块各自成 markdown 容器，顺序保留
+    const texts = textBlocksOf(card);
+    expect(texts).toEqual(["先看一下文件", "读完了"]);
+  });
+
+  it("纯文本入参与无工具 blocks 都不产生折叠面板", () => {
+    const strCard = buildMarkdownCard("普通回复") as any;
+    expect(JSON.stringify(strCard)).not.toContain("collapsible_panel");
+
+    const blocksCard = buildMarkdownCard([
+      { type: "text", content: "只有正文" },
+      { type: "text", content: "第二段" },
+    ]) as any;
+    expect(JSON.stringify(blocksCard)).not.toContain("collapsible_panel");
+    expect(textBlocksOf(blocksCard)).toEqual(["只有正文", "第二段"]);
+  });
+
+  it("markdownCardBlocksToText 拍平格式与 assistant 文本拼接一致", () => {
+    const text = markdownCardBlocksToText([
+      { type: "text", content: "正文A" },
+      { type: "tool", name: "Bash", line: "🔧 **Bash** ls", detail: "" },
+      { type: "text", content: "正文B" },
+    ]);
+    expect(text).toBe("正文A\n\n🔧 **Bash** ls\n\n正文B");
+  });
+
+  it("blocks 版式超 28KB 时回退纯文本版式（截断提示、无面板、内容不丢头部）", () => {
+    const huge = { type: "text" as const, content: "很长的正文\n".repeat(10000) };
+    const card = buildMarkdownCard([
+      { type: "tool", name: "Bash", line: "🔧 **Bash** ls -la", detail: '```json\n{"command": "ls -la"}\n```' },
+      huge,
+    ]) as any;
+
+    const s = JSON.stringify(card);
+    expect(s).not.toContain("collapsible_panel"); // 回退纯文本版式
+    expect(s).toContain("内容过长"); // 统一截断提示
+    expect(s).toContain("🔧 **Bash** ls -la"); // 靠前的工具行仍在（内容不丢）
+    expect(textBlocksOf(card).join("\n")).toContain("很长的正文");
+  });
+
+  it("工具面板数量超元素上限（>195）时回退纯文本版式，工具行全部保留", () => {
+    const blocks: MarkdownCardBlock[] = Array.from({ length: 200 }, (_, i) => ({
+      type: "tool" as const,
+      name: `Tool${i}`,
+      line: `🔧 **Tool${i}** cmd${i}`,
+      detail: "",
+    }));
+    const card = buildMarkdownCard(blocks) as any;
+
+    const s = JSON.stringify(card);
+    expect(s).not.toContain("collapsible_panel");
+    expect(s).toContain("cmd0");
+    expect(s).toContain("cmd199");
+    expect(s).toContain("🔧 **Tool100** cmd100");
   });
 });
 
@@ -120,6 +232,26 @@ describe("FeishuStreamingSession 超长翻页", () => {
       if (u.includes("/cardkit/v1/cards") && u.includes("/elements/content/content")) {
         const cardId = u.match(/cards\/([^/]+)\//)![1];
         putCalls.push({ cardId, content: JSON.parse(String(init?.body)).content });
+        return ok({ code: 0, msg: "ok" });
+      }
+      // 2026-10-31 起收尾整卡重渲染走 PUT /cards/{id}（№9 抹茶版式）：
+      // 记录重渲染后的正文（剥掉抬头条/KPI 等 column_set），不当作新卡
+      if (u.includes("/cardkit/v1/cards") && init?.method === "PUT" && /\/cards\/[^/]+$/.test(u)) {
+        const cardId = u.match(/cards\/([^/]+)$/)![1];
+        try {
+          const data = JSON.parse(JSON.parse(String(init?.body)).card.data);
+          const collect = (els: any[]): string[] =>
+            els.flatMap((e: any) => {
+              if (e.tag === "markdown" && !e.content?.includes("CC 小工")) return [e.content];
+              if (e.tag === "interactive_container" && e.background_style === "matcha-bg")
+                return collect(e.elements ?? []);
+              return [];
+            });
+          const md = collect(data.body?.elements ?? []).join("\n");
+          putCalls.push({ cardId, content: md });
+        } catch {
+          // 解析失败只影响测试观察，不 mock 报错
+        }
         return ok({ code: 0, msg: "ok" });
       }
       if (u.includes("/cardkit/v1/cards") && u.endsWith("/settings"))

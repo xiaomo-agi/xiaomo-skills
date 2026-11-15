@@ -1,12 +1,6 @@
 ---
 name: mycc
 description: 启动 mycc 后端服务（后台运行），通过飞书机器人远程操控 Claude Code。触发词："/mycc"、"启动 mycc"、"启动 mycc 后端"、"检查 mycc 状态"
-layer: 基础层
-authorization: A区（自动执行，无需人类介入）
-output_levels: L1（结论）
-status: active
-created: 2026-01-20
-origin: P08-cc小程序，mycc 后端服务管理需求
 ---
 
 # mycc
@@ -85,7 +79,7 @@ sleep 5 && cat .claude/skills/mycc/current.json
 - **连接信息**：保存在 `.claude/skills/mycc/current.json`
 - **停止服务**：`.claude/skills/mycc/scripts/node_modules/.bin/tsx .claude/skills/mycc/scripts/src/index.ts stop`
 - **Agent Teams 支持**：后端已完整支持 Agent Teams（建队、派成员、通信、关队），CLI 2.1.63+ 原生支持，settingSources patch 仍需保留
-- **改代码后必须重启**：tsx 不热更新，修改 `scripts/src/` 下的代码后必须用 `restart` 子命令重启后端，否则跑的还是旧代码。若 AI 自己跑在这个后端里，要用延迟脚本（setsid 后台 sleep 后再 restart），先把回复发完
+- **改代码后必须重启**：tsx 不热更新，修改 `scripts/src/` 下的代码后必须用 `restart` 子命令重启后端，否则跑的还是旧代码。若 AI 自己跑在这个后端里，要用延迟脚本（macOS 没有 setsid，用 `nohup bash -c 'sleep 5 && <restart 命令>' >> mycc.log 2>&1 & disown`），先把回复发完；**不要吞错误输出**，布置完用 `ps`/日志确认真的执行了
 
 ## 遇到问题？
 

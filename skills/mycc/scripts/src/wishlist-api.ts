@@ -237,7 +237,7 @@ export async function handleWishlistRoute(
 
     writeData(data);
 
-    json(res, 200, { ok: true, claimId, message: "认领成功！小mo确认收货后你会出现在榜单上 ✨" });
+    json(res, 200, { ok: true, claimId, message: "认领成功！owner确认收货后你会出现在榜单上 ✨" });
     return true;
   }
 

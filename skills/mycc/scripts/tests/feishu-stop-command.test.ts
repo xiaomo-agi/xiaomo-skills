@@ -37,6 +37,21 @@ function cleanPersistedState() {
 
 // ==================== 卡片构建 ====================
 
+function cardButtons(card: Record<string, unknown>): any[] {
+  const out: any[] = [];
+  const strip = (s: string) => String(s).replace(/<[^>]+>/g, "").replace(/\*\*/g, "");
+  const walk = (els: any[]) =>
+    els.forEach((e: any) => {
+      if (e.tag === "interactive_container" && Array.isArray(e.behaviors)) {
+        out.push({ text: { content: strip(e.elements?.[0]?.content ?? "") }, value: e.behaviors[0].value });
+      }
+      if (Array.isArray(e.elements)) walk(e.elements);
+      if (Array.isArray(e.columns)) e.columns.forEach((c: any) => walk(c.elements ?? []));
+    });
+  walk(card.body?.elements ?? card.elements ?? []);
+  return out;
+}
+
 describe("processingNoticeCard / 白名单", () => {
   it("parseCardCommandValue 放行 /stop", () => {
     expect(parseCardCommandValue({ cmd: "/stop" })).toEqual({ cmd: "/stop", arg: undefined });
@@ -45,20 +60,17 @@ describe("processingNoticeCard / 白名单", () => {
   it("卡片含终止（danger）和查看进度按钮，文案原样带入", () => {
     const card = processingNoticeCard("正在处理消息（已进行 30 秒）。") as any;
     expect(JSON.stringify(card)).toContain("已进行 30 秒");
-    const buttons = (card.elements as any[])
-      .filter((e) => e.tag === "action")
-      .flatMap((e) => e.actions);
+    const buttons = cardButtons(card);
     const stopBtn = buttons.find((b: any) => b.value.cmd === "/stop");
     expect(stopBtn).toBeTruthy();
-    expect(stopBtn.type).toBe("danger");
+    // danger 语义在卡片 JSON 里体现为灰描边（样式在容器上，提取器只留 value/text）
+    expect(JSON.stringify(card)).toContain("grey-200");
     expect(buttons.some((b: any) => b.value.cmd === "/status")).toBe(true);
   });
 
   it("helpMenuCard 会话组包含 /stop 按钮", () => {
     const card = helpMenuCard() as any;
-    const buttons = (card.elements as any[])
-      .filter((e) => e.tag === "action")
-      .flatMap((e) => e.actions);
+    const buttons = cardButtons(card);
     expect(buttons.some((b: any) => b.value.cmd === "/stop")).toBe(true);
   });
 });

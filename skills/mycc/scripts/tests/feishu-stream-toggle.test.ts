@@ -37,9 +37,18 @@ function cleanPersistedState() {
 }
 
 function cardButtons(card: Record<string, unknown>): any[] {
-  return ((card as any).elements as any[])
-    .filter((e) => e.tag === "action")
-    .flatMap((e) => e.actions);
+  const out: any[] = [];
+  const strip = (s: string) => String(s).replace(/<[^>]+>/g, "").replace(/\*\*/g, "");
+  const walk = (els: any[]) =>
+    els.forEach((e: any) => {
+      if (e.tag === "interactive_container" && Array.isArray(e.behaviors)) {
+        out.push({ text: { content: strip(e.elements?.[0]?.content ?? "") }, value: e.behaviors[0].value });
+      }
+      if (Array.isArray(e.elements)) walk(e.elements);
+      if (Array.isArray(e.columns)) e.columns.forEach((c: any) => walk(c.elements ?? []));
+    });
+  walk(card.body?.elements ?? card.elements ?? []);
+  return out;
 }
 
 // ==================== 卡片构建 ====================
@@ -156,6 +165,7 @@ describe("FeishuCommands /stream", () => {
         start: vi.fn(async () => {}),
         update: vi.fn(async (text: string) => { updates.push(text); }),
         close: vi.fn(async (text?: string) => { closes.push(text ?? ""); }),
+        addToolCall: vi.fn(() => {}),
         isActive: () => true,
       })),
     };
@@ -282,14 +292,15 @@ describe("FeishuCommands /stream", () => {
 
   // ============ 回合收尾状态行（流式卡片） ============
 
-  it("流式卡片正常收尾 → 末尾带 ✅ 已完成状态行", async () => {
+  it("流式卡片正常收尾 → 正文不带状态行（完成状态在抬头条/KPI）", async () => {
     const { channel, closes } = streamingChannel();
     const commands = new FeishuCommands(createDeps({ feishuChannel: channel }));
 
     await commands.processMessage("帮我看看", undefined, undefined, "om_1", ctx);
     expect(closes).toHaveLength(1);
     expect(closes[0]).toContain("查完了。");
-    expect(closes[0]).toContain("✅ 已完成 · 耗时");
+    // 2026-10-31 owner：KPI 行已有耗时，正文不再追"✅ 已完成·耗时"
+    expect(closes[0]).not.toContain("✅ 已完成 · 耗时");
   });
 
   it("流式卡片出错收尾 → 部分正文 + 错误提示 + ❌ 状态行", async () => {
@@ -314,7 +325,7 @@ describe("FeishuCommands /stream", () => {
     expect(closes[0]).toContain("❌ 出错中断 · 已运行");
   });
 
-  it("回合中被 /stop 终止 → 收尾状态行是 🛑 而不是 ✅", async () => {
+  it("回合中被 /stop 终止 → 正文不带状态行（🛑 语义在抬头条）", async () => {
     const { channel, closes } = streamingChannel();
     let commands: FeishuCommands;
     const deps = createDeps({
@@ -336,7 +347,7 @@ describe("FeishuCommands /stream", () => {
     await commands.processMessage("帮我看看", undefined, undefined, "om_1", ctx);
     expect(closes).toHaveLength(1);
     expect(closes[0]).toContain("跑到一半");
-    expect(closes[0]).toContain("🛑 已手动终止 · 已运行");
+    expect(closes[0]).toBe("跑到一半");
     expect(closes[0]).not.toContain("✅");
   });
 });

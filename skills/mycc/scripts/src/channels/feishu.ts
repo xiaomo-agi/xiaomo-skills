@@ -16,8 +16,11 @@ import {
   FeishuStreamingSession,
   buildMarkdownCard,
   normalizeFeishuMarkdownLinks,
+  markdownCardBlocksToText,
+  type MarkdownCardBlock,
 } from "./feishu-streaming.js";
 import { summarizeToolInput } from "./tool-summary.js";
+import { readJsonFile, writeJsonFileAtomic } from "../json-store.js";
 
 /**
  * 逐事件调试日志开关（MYCC_DEBUG=1 或 true 时开启）。
@@ -109,11 +112,16 @@ export type FeishuCardActionHandler = (
 export class FeishuChannel implements MessageChannel {
   readonly id = "feishu";
 
+  /** 通道能力标记（方案A）：sendMarkdownReply 支持 MarkdownCardBlock[] 入参
+   *  （静态卡把工具调用渲染成 collapsible_panel）；命令层据此决定传 blocks 还是拍平文本 */
+  readonly acceptsMarkdownCardBlocks = true;
+
   private config: FeishuChannelConfig;
   private label: string;
   private accessToken: string | null = null;
   private tokenExpireTime: number = 0;
   private pendingImages = new Map<string, string>(); // sessionId → image_key
+  private lastSavedImagePaths: string[] = []; // 本次解析落盘的图片路径（随取随清）
 
   // WebSocket 相关
   private wsClient: Lark.WSClient | null = null;
@@ -128,14 +136,41 @@ export class FeishuChannel implements MessageChannel {
   private readonly WS_WATCHDOG_INTERVAL_MS = 60_000;
   private readonly WS_RECONNECT_STALE_MS = 3 * 60_000;
 
+  // 启动自愈（2026-10-12 断网事故）：start() 取凭证失败时按退避间隔重试整个启动
+  private startRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private startRetryCount = 0;
+  private readonly START_RETRY_BASE_MS = 30_000;
+  private readonly START_RETRY_MAX_MS = 5 * 60_000;
+
+  // 入站去重（2026-10-26 重复投递修复）：飞书 WS 长连接是 at-least-once，
+  // 重连后服务端会重推同一 message_id 事件；全链路此前无任何去重，导致
+  // 同一条消息一字不差被完整处理两轮。按 messageId 记忆 24h 内见过的消息，
+  // 重复直接丢。参数对照 Hermes feishu adapter（TTL 24h / 容量 2048 /
+  // 原子落盘，重启后仍去重）。
+  private seenMessageIds = new Map<string, number>(); // messageId → seenAt(ms)
+  private seenIdsDirty = false;
+  private seenIdsFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private seenIdsFile = ""; // constructor 时按 label 定位（按 bot 分文件，5 bot 互不覆盖）
+  private static readonly DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+  private static readonly DEDUP_MAX_IDS = 2048;
+
   // 消息合并缓冲（解决同时发图+文字时图片被并发锁丢弃的问题）
   // 按 scope+发送者 分桶，不同群/话题的消息互不干扰
   private messageBuffers = new Map<string, {
     items: Array<{ text: string; images?: Array<{ data: string; mediaType: string }>; files?: Array<{ filePath: string; fileName: string }>; messageId?: string }>;
     timer: ReturnType<typeof setTimeout> | null;
+    /** 本缓冲首条消息的到达时间（纯文字硬封顶用；flush 删桶后自然重建） */
+    firstAt?: number;
     ctx: FeishuMessageContext;
   }>();
-  private readonly BUFFER_DELAY = 300; // ms，等待后续消息到达
+  private readonly BUFFER_DELAY = 350; // ms，等待后续消息到达（2026-10-26 P2-2：300→350，对齐 Hermes 防抖参数）
+  // 纯文字连发的硬封顶：缓冲里首条到达后再多消息也最多等这么久就 flush，
+  // 防止"每条都重置定时器"在持续连发下无限拖延（Hermes hard cap 同款思路）
+  private readonly TEXT_BUFFER_HARD_CAP_MS = 1000;
+  // 飞书把一次发的多张图拆成多条独立 image 事件推送，且每张图走 API 下载耗时参差，
+  // 300ms 窗口等不齐 → 每张图各自成批进会话，后到的还会被处理锁拒绝丢弃（2026-10-09 丢图根因）。
+  // 缓冲里含图片/文件时改用长聚合窗口，等它们落进同一批。
+  private readonly MEDIA_BUFFER_DELAY = 2000; // ms，缓冲含图片/文件时的聚合窗口
 
   // 表态相关（"正在输入" emoji），按 messageId 记录，多会话并发时互不覆盖
   private typingReactions = new Map<string, string>(); // messageId → reactionId
@@ -187,6 +222,10 @@ export class FeishuChannel implements MessageChannel {
         (msg: string) => console.log(`${this.lp} ${msg}`)
       );
     }
+
+    // 入站去重：加载历史缓存，进程退出时兜底落盘（flush 内部是同步原子写）
+    this.loadSeenMessageIds();
+    process.on("exit", () => this.flushSeenMessageIds());
   }
 
   /**
@@ -243,8 +282,11 @@ export class FeishuChannel implements MessageChannel {
 
     // 提取文本内容
     let text = "";
+    let staticBlocks: MarkdownCardBlock[] | null = null;
     if (event.type === "assistant") {
-      text = this.extractAssistantText(event);
+      const extracted = this.extractAssistantContent(event);
+      text = extracted.text;
+      staticBlocks = extracted.blocks;
       if (text) {
         console.log(`${this.lp} [assistant] 提取 ${text.length} 字符`);
       }
@@ -265,9 +307,9 @@ export class FeishuChannel implements MessageChannel {
     if (this.useStreamingCards && this.streamingSession) {
       await this.streamUpdate(text);
     } else {
-      // 降级：静态卡片
+      // 降级：静态卡片（方案A：含工具调用时传 blocks，工具行渲染成折叠面板）
       const sessionId = this.extractSessionId(event);
-      await this.sendMessageToFeishu(text, sessionId);
+      await this.sendMessageToFeishu(staticBlocks ?? text, sessionId);
     }
   }
 
@@ -285,6 +327,84 @@ export class FeishuChannel implements MessageChannel {
    */
   onCardAction(callback: FeishuCardActionHandler): void {
     this.cardActionCallback = callback;
+  }
+
+  /**
+   * 去重缓存落盘文件路径（按 bot label 分文件，多 bot 实例互不覆盖）
+   */
+  private resolveSeenIdsFile(): string {
+    const dataDir = process.env.MYCC_DATA_DIR || path.resolve(import.meta.dirname, "../data");
+    return path.join(dataDir, `feishu-seen-ids-${this.label || "default"}.json`);
+  }
+
+  /** 启动时加载去重缓存（文件不存在/损坏时从空开始，不影响功能） */
+  private loadSeenMessageIds(): void {
+    this.seenIdsFile = this.resolveSeenIdsFile();
+    const stored = readJsonFile<Record<string, number>>(this.seenIdsFile);
+    if (!stored) return;
+    const cutoff = Date.now() - FeishuChannel.DEDUP_TTL_MS;
+    for (const [id, seenAt] of Object.entries(stored)) {
+      if (typeof seenAt === "number" && seenAt > cutoff) {
+        this.seenMessageIds.set(id, seenAt);
+      }
+    }
+    if (this.seenMessageIds.size > 0) {
+      console.log(`${this.lp} 去重缓存已加载: ${this.seenMessageIds.size} 个 message_id (24h 内)`);
+    }
+  }
+
+  /**
+   * 命中 TTL 内已见过的 message_id → true（重复事件，应丢弃）；
+   * 未见过则记录并安排落盘。惰性清过期 + 超容量裁剪保留最新。
+   */
+  private isDuplicateMessage(messageId: string): boolean {
+    const now = Date.now();
+    const seenAt = this.seenMessageIds.get(messageId);
+    if (seenAt !== undefined) {
+      if (now - seenAt < FeishuChannel.DEDUP_TTL_MS) {
+        return true;
+      }
+      this.seenMessageIds.delete(messageId); // 过期：视为新消息
+    }
+    this.seenMessageIds.set(messageId, now);
+
+    if (this.seenMessageIds.size > FeishuChannel.DEDUP_MAX_IDS) {
+      const cutoff = now - FeishuChannel.DEDUP_TTL_MS;
+      for (const [id, at] of this.seenMessageIds) {
+        if (at <= cutoff) this.seenMessageIds.delete(id);
+      }
+      if (this.seenMessageIds.size > FeishuChannel.DEDUP_MAX_IDS) {
+        const keep = [...this.seenMessageIds.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, FeishuChannel.DEDUP_MAX_IDS);
+        this.seenMessageIds = new Map(keep);
+      }
+    }
+
+    this.scheduleSeenIdsFlush();
+    return false;
+  }
+
+  /** 防抖落盘：5s 合并写（消息低频场景，落盘开销可忽略） */
+  private scheduleSeenIdsFlush(): void {
+    this.seenIdsDirty = true;
+    if (this.seenIdsFlushTimer) return;
+    this.seenIdsFlushTimer = setTimeout(() => {
+      this.seenIdsFlushTimer = null;
+      this.flushSeenMessageIds();
+    }, 5_000);
+    (this.seenIdsFlushTimer as any).unref?.();
+  }
+
+  /** 把去重缓存原子写盘（脏了才写；失败只降级为内存去重，不影响消息处理） */
+  private flushSeenMessageIds(): void {
+    if (!this.seenIdsDirty || !this.seenIdsFile) return;
+    try {
+      writeJsonFileAtomic(this.seenIdsFile, Object.fromEntries(this.seenMessageIds));
+      this.seenIdsDirty = false;
+    } catch (err) {
+      console.warn(`${this.lp} ⚠ 去重缓存落盘失败（内存去重仍生效）:`, err);
+    }
   }
 
   /**
@@ -372,8 +492,16 @@ export class FeishuChannel implements MessageChannel {
     const token = await this.getAccessToken();
     if (!token) {
       console.error("[FeishuChannel] ✗ Invalid credentials");
+      // 断网/飞书不可达时不能就这么躺下（2026-10-12 事故：启动赶上断网，
+      // 通道死透且无人重试），安排退避重试，网络恢复后自动上线
+      this.scheduleStartRetry();
       return;
     }
+
+    if (this.startRetryCount > 0) {
+      console.log(`[FeishuChannel] ✓ 自愈成功：第 ${this.startRetryCount + 1} 次尝试后凭证恢复，通道上线`);
+    }
+    this.startRetryCount = 0;
 
     this.accessToken = token;
 
@@ -426,19 +554,21 @@ export class FeishuChannel implements MessageChannel {
             const event = data as any;
             const messageId = event?.message?.message_id;
 
+            // 入站去重（最先检查）：飞书 WS 重连会重推同一事件（at-least-once），
+            // 同 message_id 直接丢弃——此前无去重，同一条消息被完整处理两轮
+            if (messageId && this.isDuplicateMessage(messageId)) {
+              console.log(`${this.lp} ⏭️ 重复投递已丢弃 (messageId=${messageId})`);
+              return;
+            }
+
             // 打印发送者 open_id，方便配置 RECEIVE_USER_ID
             const senderId = event?.sender?.sender_id?.open_id || event?.sender?.id?.open_id;
             if (senderId) {
               debugLog(`[FeishuChannel] [DEBUG] 发送者 open_id: ${senderId}`);
             }
 
-            // 添加"正在输入"表态（敲键盘 emoji）
-            if (messageId) {
-              this.addTypingIndicator(messageId).catch(() => {
-                // 静默失败，不影响主流程
-              });
-            }
-
+            // "正在输入"表态不在此无条件添加：路由判定本bot要处理时才亮
+            // （见 http-server.ts onMessage 回调），避免@了别人时所有bot都亮一下"已读"。
             // await 解析结果（图片/文件下载是异步的）
             const parsed = await this.parseFeishuMessage(event, messageId);
             if (!parsed || !this.messageCallback) {
@@ -475,13 +605,23 @@ export class FeishuChannel implements MessageChannel {
               this.messageBuffers.set(bufferKey, buffer);
             }
             if (buffer.timer) clearTimeout(buffer.timer);
+            const now = Date.now();
+            if (!buffer.firstAt) buffer.firstAt = now;
             buffer.items.push({ text: text || "", images, files, messageId });
 
-            console.log(`${this.lp} ✓ 收到消息（缓冲中, scope=${scope}）: ${text ? text.substring(0, 50) : images ? "[图片]" : "[文件]"}...`);
+            console.log(`${this.lp} ✓ 收到消息（缓冲中, scope=${scope}, id=${messageId || "无"}）: ${text ? text.substring(0, 50) : images ? "[图片]" : "[文件]"}...`);
 
-            buffer.timer = setTimeout(() => {
+            // 缓冲里含图片/文件时用长聚合窗口（多图被拆成多条事件+下载耗时参差，
+            // 等不齐会把一批图拆成多个回合）；纯文字 350ms 且距首条超 1s 硬封顶，
+            // 持续连发不再无限拖延（P2-2）
+            const hasMedia = buffer.items.some(it => (it.images && it.images.length > 0) || (it.files && it.files.length > 0));
+            if (!hasMedia && now - buffer.firstAt >= this.TEXT_BUFFER_HARD_CAP_MS) {
               this.flushMessageBuffer(bufferKey);
-            }, this.BUFFER_DELAY);
+            } else {
+              buffer.timer = setTimeout(() => {
+                this.flushMessageBuffer(bufferKey);
+              }, hasMedia ? this.MEDIA_BUFFER_DELAY : this.BUFFER_DELAY);
+            }
           } catch (err) {
             console.error("[FeishuChannel] 消息处理错误:", err);
           }
@@ -592,6 +732,52 @@ export class FeishuChannel implements MessageChannel {
   }
 
   /**
+   * 启动失败自愈：start() 取凭证失败（断网/飞书不可达）时周期重试整个启动。
+   * 指数退避 30s→60s→120s→300s（封顶），直到成功或 stop()。
+   * 不设重试上限：断网可能持续数小时，封顶后每 5 分钟试一次成本可忽略。
+   */
+  private scheduleStartRetry(): void {
+    if (this.isWebSocketStopped || this.startRetryTimer) {
+      return;
+    }
+
+    const delay = Math.min(this.START_RETRY_BASE_MS * 2 ** this.startRetryCount, this.START_RETRY_MAX_MS);
+    this.startRetryCount++;
+    console.warn(`[FeishuChannel] ${Math.round(delay / 1000)}s 后重试启动（第 ${this.startRetryCount} 次，网络恢复后会自动上线）`);
+
+    this.startRetryTimer = setTimeout(async () => {
+      this.startRetryTimer = null;
+      if (this.isWebSocketStopped) {
+        return;
+      }
+      await this.start();
+    }, delay);
+
+    (this.startRetryTimer as any).unref?.();
+  }
+
+  /**
+   * 把飞书 @ 消息文本里的占位符还原成可读内容：
+   * - @机器人自己 → 删除。群里 "@bot /help" 的原始文本是 "@_user_1 /help"，
+   *   不删的话 startsWith("/") 判定失败，命令整条被当普通消息喂给 Claude
+   * - @其他人 / @all → 替换成 "@名字"，消息语义保留
+   * 路由判断（@all/@本bot）走 ctx.mentions 数组，不依赖文本占位符，此处只影响展示文本。
+   */
+  private restoreMentionPlaceholders(text: string, mentions?: any[]): string {
+    if (!text || !mentions?.length) return text;
+    let result = text;
+    for (const m of mentions) {
+      const key = m?.key;
+      if (!key || typeof key !== "string") continue;
+      const id = m?.id;
+      const openId = typeof id === "string" ? id : id?.open_id;
+      const isSelf = !!this.botOpenId && openId === this.botOpenId;
+      result = result.split(key).join(isSelf ? "" : `@${m?.name || "用户"}`);
+    }
+    return result.trim();
+  }
+
+  /**
    * 解析飞书消息（异步，支持图片下载）
    */
   private async parseFeishuMessage(event: any, messageId?: string): Promise<{ text: string; images?: Array<{ data: string; mediaType: string }>; files?: Array<{ filePath: string; fileName: string }> } | null> {
@@ -619,10 +805,10 @@ export class FeishuChannel implements MessageChannel {
         // 文本消息 - content 是 JSON 字符串
         if (typeof content === "string") {
           const parsed = JSON.parse(content);
-          return { text: parsed.text || "" };
+          return { text: this.restoreMentionPlaceholders(parsed.text || "", message?.mentions) };
         }
         // 兜底：content 可能已经是对象
-        return { text: content?.text || "" };
+        return { text: this.restoreMentionPlaceholders(content?.text || "", message?.mentions) };
       }
 
       if (messageType === "image") {
@@ -633,13 +819,72 @@ export class FeishuChannel implements MessageChannel {
           const imageKey = parsed.image_key;
           if (imageKey) {
             // 需要通过飞书 API 获取图片数据
-            return this.downloadImageFromFeishu(imageKey, messageId).then(data => ({
-              text: "",
-              images: data ? [{ data, mediaType: "image/png" }] : undefined
-            }));
+            return this.downloadImageFromFeishu(imageKey, messageId).then(data => {
+              const paths = this.lastSavedImagePaths.splice(0);
+              const savedNote = paths.length ? `[图片已保存: ${paths.join("、")}]` : "";
+              return {
+                text: savedNote,
+                images: data ? [{ data, mediaType: "image/png" }] : undefined
+              };
+            });
           }
         }
         console.log(`[FeishuChannel] 图片消息没有 image_key`);
+        return { text: "" };
+      }
+
+      if (messageType === "post") {
+        // 富文本消息（图文混排）：文字段按段落拼接 + 所有 img 段下载成图。
+        // 飞书客户端把多条内容合并成一条 post 发送是「一次发多张图」的自然路径，
+        // 此前直接 return null 整条丢弃、连文字都不提取（2026-10-09 日志实锤）。
+        console.log(`[FeishuChannel] 收到富文本(post)消息`);
+        const post = typeof content === "string" ? JSON.parse(content) : content;
+        if (post && Array.isArray(post.content)) {
+          const lines: string[] = [];
+          if (post.title) lines.push(String(post.title));
+          const imageKeys: string[] = [];
+          let skippedMedia = 0;
+          for (const paragraph of post.content) {
+            if (!Array.isArray(paragraph)) continue;
+            const parts: string[] = [];
+            for (const node of paragraph) {
+              if (!node || typeof node !== "object") continue;
+              if (node.tag === "text" && typeof node.text === "string") {
+                parts.push(node.text);
+              } else if (node.tag === "a") {
+                parts.push(node.href ? `${node.text || ""}(${node.href})` : (node.text || ""));
+              } else if (node.tag === "at") {
+                parts.push(`@${node.user_name || ""}`);
+              } else if (node.tag === "img" && node.image_key) {
+                imageKeys.push(node.image_key);
+              } else if (node.tag === "media" || node.tag === "file") {
+                skippedMedia++;
+              }
+            }
+            const line = parts.join("").trim();
+            if (line) lines.push(line);
+          }
+          if (skippedMedia > 0) {
+            lines.push(`（含 ${skippedMedia} 个媒体/文件段，暂不支持处理已跳过）`);
+          }
+          const text = lines.join("\n");
+          if (imageKeys.length > 0) {
+            // 并行下载（与多图事件路径一致；token 已缓存时无刷新竞态）
+            const results = await Promise.all(
+              imageKeys.map(key => this.downloadImageFromFeishu(key, messageId)),
+            );
+            const images = results
+              .filter((data): data is string => !!data)
+              .map(data => ({ data, mediaType: "image/png" }));
+            const savedPaths = this.lastSavedImagePaths.splice(0);
+            const savedNote = savedPaths.length ? `[图片已保存: ${savedPaths.join("、")}]` : "";
+            if (text || images.length > 0) {
+              return { text: text + savedNote, images: images.length > 0 ? images : undefined };
+            }
+            return { text: savedNote };
+          }
+          return { text };
+        }
         return { text: "" };
       }
 
@@ -760,9 +1005,20 @@ export class FeishuChannel implements MessageChannel {
       clearTimeout(this.wsRestartTimer);
       this.wsRestartTimer = null;
     }
+    if (this.startRetryTimer) {
+      clearTimeout(this.startRetryTimer);
+      this.startRetryTimer = null;
+    }
 
     this.accessToken = null;
     this.pendingImages.clear();
+
+    // 去重缓存：清防抖定时器并兜底落盘（优雅停机路径）
+    if (this.seenIdsFlushTimer) {
+      clearTimeout(this.seenIdsFlushTimer);
+      this.seenIdsFlushTimer = null;
+    }
+    this.flushSeenMessageIds();
 
     // 关闭流式卡片
     this.closeStreamingCard().catch(() => {});
@@ -840,24 +1096,44 @@ export class FeishuChannel implements MessageChannel {
   }
 
   /**
-   * 从 assistant 事件提取所有 text + tool_use，拼接为完整文本
+   * 从 assistant 事件提取所有 text + tool_use，拼接为完整文本；
+   * 方案A：含工具调用时同时产出 blocks（静态卡把 🔧 行渲染成 collapsible_panel
+   * 折叠面板），纯文本事件 blocks=null——走原字符串入参，版式与旧版完全一致
    */
-  private extractAssistantText(event: Record<string, unknown>): string {
+  private extractAssistantContent(event: Record<string, unknown>): {
+    text: string;
+    blocks: MarkdownCardBlock[] | null;
+  } {
     const parts: string[] = [];
+    const blocks: MarkdownCardBlock[] = [];
+    let hasTool = false;
     if ("message" in event && typeof event.message === "object") {
       const message = event.message as any;
       if (message.content && Array.isArray(message.content)) {
         for (const block of message.content) {
           if (block.type === "text") {
             parts.push(String(block.text));
+            blocks.push({ type: "text", content: String(block.text) });
           } else if (block.type === "tool_use" && this.config.showToolUse) {
-            const formatted = this.formatToolUseBlock(block as Record<string, unknown>);
+            const b = block as Record<string, unknown>;
+            const formatted = this.formatToolUseBlock(b);
             if (formatted) parts.push(`\n${formatted}\n`);
+            const toolName = String(b.name || "unknown");
+            // 方案B：同步记录结构化工具调用，close() 收尾时渲染成折叠面板
+            const detail = b.input
+              ? "```json\n" +
+                JSON.stringify(b.input, null, 1).slice(0, 600) +
+                "\n```"
+              : "";
+            this.streamingSession?.addToolCall(toolName, formatted || "", detail);
+            // 方案A：静态卡 blocks 入参（正文段+工具面板交替）
+            blocks.push({ type: "tool", name: toolName, line: formatted || "", detail });
+            hasTool = true;
           }
         }
       }
     }
-    return parts.join("\n");
+    return { text: parts.join("\n"), blocks: hasTool ? blocks : null };
   }
 
   /**
@@ -1032,6 +1308,13 @@ export class FeishuChannel implements MessageChannel {
           const buffer = await resourceResponse.arrayBuffer();
           const base64 = Buffer.from(buffer).toString("base64");
           console.log(`[FeishuChannel] ✓ Downloaded image: ${base64.length} bytes (base64)`);
+          // 同时落盘一份，让 Agent 能拿到文件路径（图生图/导出等场景需要）
+          const tmpDir = path.join(os.tmpdir(), "mycc-feishu");
+          if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+          const imgPath = path.join(tmpDir, `${Date.now()}_img.png`);
+          fs.writeFileSync(imgPath, Buffer.from(buffer));
+          this.lastSavedImagePaths.push(imgPath);
+          console.log(`[FeishuChannel] ✓ Image saved: ${imgPath}`);
           return base64;
         } else {
           const errorText = await resourceResponse.text();
@@ -1069,7 +1352,7 @@ export class FeishuChannel implements MessageChannel {
   /**
    * 发送消息到飞书
    */
-  private async sendMessageToFeishu(text: string, sessionId?: string): Promise<boolean> {
+  private async sendMessageToFeishu(content: string | MarkdownCardBlock[], sessionId?: string): Promise<boolean> {
     try {
       if (!this.accessToken || Date.now() > this.tokenExpireTime) {
         this.accessToken = await this.getAccessToken();
@@ -1092,12 +1375,51 @@ export class FeishuChannel implements MessageChannel {
         }
       }
 
-      const normalizedText = normalizeFeishuMarkdownLinks(text);
-      return await this.sendMarkdownCardMessage(userId, normalizedText, target.receiveIdType);
+      return await this.sendMarkdownCardMessage(userId, this.normalizeOutbound(content), target.receiveIdType);
     } catch (error) {
       console.error("[FeishuChannel] Send error:", error);
       return false;
     }
+  }
+
+  /** 出站内容统一做飞书链接规范化：纯文本整段处理；blocks 只处理正文段
+   *  （工具面板内容与方案B流式收尾口径一致，保持原样不转链） */
+  private normalizeOutbound(content: string | MarkdownCardBlock[]): string | MarkdownCardBlock[] {
+    if (typeof content === "string") return normalizeFeishuMarkdownLinks(content);
+    return content.map((b) =>
+      b.type === "text" ? { ...b, content: normalizeFeishuMarkdownLinks(b.content) } : b
+    );
+  }
+
+  /**
+   * 出站发送轻量重试（2026-10-26 P2-3）：仅对网络异常 / HTTP 5xx / 429 重试
+   * （最多 2 次，1s/3s 退避）；业务性 code!=0（目标不存在、参数错等）是确定性
+   * 失败，调用方解析 code 后自行返回，不在这里重试。
+   * 返回 null = 重试耗尽（调用方按发送失败处理）。
+   */
+  private async fetchWithRetry(url: string, init: RequestInit, label: string): Promise<Response | null> {
+    const delays = [1000, 3000];
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      try {
+        const res = await fetch(url, init);
+        if ((res.status >= 500 || res.status === 429) && attempt < delays.length) {
+          console.warn(`${this.lp} ⚠ ${label} HTTP ${res.status}，${delays[attempt] / 1000}s 后重试 (${attempt + 1}/2)`);
+          await sleep(delays[attempt]);
+          continue;
+        }
+        return res;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < delays.length) {
+          console.warn(`${this.lp} ⚠ ${label} 网络异常，${delays[attempt] / 1000}s 后重试 (${attempt + 1}/2):`, err instanceof Error ? err.message : err);
+          await sleep(delays[attempt]);
+          continue;
+        }
+      }
+    }
+    console.error(`${this.lp} ✗ ${label} 重试耗尽:`, lastErr instanceof Error ? lastErr.message : lastErr);
+    return null;
   }
 
   /**
@@ -1114,11 +1436,11 @@ export class FeishuChannel implements MessageChannel {
   /**
    * 发送交互卡片消息（公开：命令层发带按钮的卡片用）
    */
-  async sendInteractiveCard(userId: string, card: any, idType?: "open_id" | "chat_id"): Promise<boolean> {
+  async sendInteractiveCard(userId: string, card: any, idType?: "open_id" | "chat_id"): Promise<string | null> {
     try {
       if (!this.accessToken || Date.now() > this.tokenExpireTime) {
         this.accessToken = await this.getAccessToken();
-        if (!this.accessToken) return false;
+        if (!this.accessToken) return null;
       }
       const receiveIdType = idType || this.config.receiveIdType || "open_id";
       await this.throttleCardSend();
@@ -1129,38 +1451,45 @@ export class FeishuChannel implements MessageChannel {
         content: JSON.stringify(card)
       };
 
-      const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${this.accessToken}`,
-          "Content-Type": "application/json; charset=utf-8",
+      const response = await this.fetchWithRetry(
+        `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`,
+        {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${this.accessToken}`,
+            "Content-Type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify(responseBody),
         },
-        body: JSON.stringify(responseBody),
-      });
+        "发送交互卡片",
+      );
+      if (!response) return null;
 
       const result = await response.json();
       if (result.code === 0) {
         console.log(`[FeishuChannel] ✓ Sent interactive card`);
-        return true;
+        // 返回消息 id：审批卡需要它在卡下方回复状态卡（09-06 状态回写）
+        return (result as any).data?.message_id ?? null;
       } else {
         console.error("[FeishuChannel] ✗ Send failed:", result.msg);
-        return false;
+        return null;
       }
     } catch (error) {
       console.error("[FeishuChannel] ✗ Send interactive card error:", error);
-      return false;
+      return null;
     }
   }
 
   /**
    * 发送 schema 2.0 markdown 卡片消息
-   * 完整支持代码块、表格、链接、加粗等 markdown 语法
+   * 完整支持代码块、表格、链接、加粗等 markdown 语法；
+   * 入参支持 blocks（方案A：工具调用渲染成 collapsible_panel 折叠面板）
    */
-  private async sendMarkdownCardMessage(userId: string, text: string, idType?: "open_id" | "chat_id"): Promise<boolean> {
+  private async sendMarkdownCardMessage(userId: string, content: string | MarkdownCardBlock[], idType?: "open_id" | "chat_id"): Promise<boolean> {
     try {
       const receiveIdType = idType || this.config.receiveIdType || "open_id";
       await this.throttleCardSend();
-      const card = buildMarkdownCard(text);
+      const card = buildMarkdownCard(content);
 
       const responseBody = {
         receive_id: userId,
@@ -1168,7 +1497,7 @@ export class FeishuChannel implements MessageChannel {
         content: JSON.stringify(card),
       };
 
-      const response = await fetch(
+      const response = await this.fetchWithRetry(
         `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`,
         {
           method: "POST",
@@ -1177,13 +1506,16 @@ export class FeishuChannel implements MessageChannel {
             "Content-Type": "application/json; charset=utf-8",
           },
           body: JSON.stringify(responseBody),
-        }
+        },
+        "发送卡片",
       );
+      if (!response) return false;
 
       const result = await response.json();
       if (result.code === 0) {
+        const preview = typeof content === "string" ? content : markdownCardBlocksToText(content);
         console.log(
-          `[FeishuChannel] ✓ Sent card: ${text.substring(0, 30)}${text.length > 30 ? "..." : ""}`
+          `[FeishuChannel] ✓ Sent card: ${preview.substring(0, 30)}${preview.length > 30 ? "..." : ""}`
         );
         return true;
       } else {
@@ -1202,7 +1534,7 @@ export class FeishuChannel implements MessageChannel {
   private async sendImageMessage(userId: string, imageKey: string, idType?: "open_id" | "chat_id"): Promise<boolean> {
     try {
       const receiveIdType = idType || this.config.receiveIdType || "open_id";
-      const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`, {
+      const response = await this.fetchWithRetry(`https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${this.accessToken}`,
@@ -1213,7 +1545,8 @@ export class FeishuChannel implements MessageChannel {
           msg_type: "image",
           content: JSON.stringify({ image_key: imageKey }),
         }),
-      });
+      }, "发送图片");
+      if (!response) return false;
 
       const result = await response.json();
       if (result.code === 0) {
@@ -1396,7 +1729,7 @@ export class FeishuChannel implements MessageChannel {
    * 参照 openclaw 飞书扩展的 typing.ts 实现
    * @returns reactionId - 表态 ID，用于后续删除
    */
-  private async addTypingIndicator(messageId: string): Promise<string | null> {
+  async addTypingIndicator(messageId: string): Promise<string | null> {
     try {
       // 获取访问令牌
       if (!this.accessToken || Date.now() > this.tokenExpireTime) {
@@ -1481,13 +1814,34 @@ export class FeishuChannel implements MessageChannel {
    * 回复指定消息（markdown 卡片）：回复会自动落在正确的群和话题里
    * 多会话模式下优先用这个而不是全局 getReplyTarget()
    */
-  async sendMarkdownReply(messageId: string, text: string): Promise<boolean> {
+  async sendMarkdownReply(messageId: string, content: string | MarkdownCardBlock[], chatId?: string): Promise<boolean> {
     try {
       if (!this.accessToken || Date.now() > this.tokenExpireTime) {
         this.accessToken = await this.getAccessToken();
         if (!this.accessToken) return false;
       }
-      const card = buildMarkdownCard(normalizeFeishuMarkdownLinks(text));
+      const card = buildMarkdownCard(this.normalizeOutbound(content));
+      // 2026-10-31 owner：不引用原消息（引用框乱排版），有 chatId 就直发会话
+      if (chatId) {
+        const direct = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${this.accessToken}`,
+            "Content-Type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify({
+            receive_id: chatId,
+            msg_type: "interactive",
+            content: JSON.stringify(card),
+          }),
+        });
+        const directResult = await direct.json();
+        if (directResult.code === 0) {
+          console.log(`${this.lp} ✓ 已发送命令卡片到会话 ${chatId}`);
+          return true;
+        }
+        console.error(`${this.lp} ✗ 直发失败，降级回复:`, directResult.msg);
+      }
       const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/reply`, {
         method: "POST",
         headers: {
@@ -1498,7 +1852,8 @@ export class FeishuChannel implements MessageChannel {
       });
       const result = await response.json();
       if (result.code === 0) {
-        console.log(`${this.lp} ✓ 已回复消息 ${messageId}: ${text.substring(0, 30)}...`);
+        const preview = typeof content === "string" ? content : markdownCardBlocksToText(content);
+        console.log(`${this.lp} ✓ 已回复消息 ${messageId}: ${preview.substring(0, 30)}...`);
         return true;
       }
       console.error(`${this.lp} ✗ 回复失败:`, result.msg);
@@ -1514,11 +1869,32 @@ export class FeishuChannel implements MessageChannel {
    * 和 sendMarkdownReply 的区别：这里不做 markdown 包装，卡片由调用方构建
    * （card-actions.ts 的按钮卡片）。
    */
-  async sendCardReply(messageId: string, card: Record<string, unknown>): Promise<boolean> {
+  async sendCardReply(messageId: string, card: Record<string, unknown>, chatId?: string): Promise<boolean> {
     try {
       if (!this.accessToken || Date.now() > this.tokenExpireTime) {
         this.accessToken = await this.getAccessToken();
         if (!this.accessToken) return false;
+      }
+      // 2026-10-31 owner：不引用原消息，有 chatId 就直发会话
+      if (chatId) {
+        const direct = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${this.accessToken}`,
+            "Content-Type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify({
+            receive_id: chatId,
+            msg_type: "interactive",
+            content: JSON.stringify(card),
+          }),
+        });
+        const directResult = await direct.json();
+        if (directResult.code === 0) {
+          console.log(`${this.lp} ✓ 已发送按钮卡片到会话 ${chatId}`);
+          return true;
+        }
+        console.error(`${this.lp} ✗ 按钮卡片直发失败，降级回复:`, directResult.msg);
       }
       const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/reply`, {
         method: "POST",

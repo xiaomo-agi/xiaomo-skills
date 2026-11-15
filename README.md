@@ -1,7 +1,7 @@
 # xiaomo-skills
 
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
-![Version](https://img.shields.io/badge/version-v1.0-green?style=flat-square)
+![Version](https://img.shields.io/badge/version-v1.1-green?style=flat-square)
 ![Claude-Skill](https://img.shields.io/badge/Claude-Skill-purple?style=flat-square)
 ![Skills](https://img.shields.io/badge/Skills-11-orange?style=flat-square)
 
@@ -161,11 +161,12 @@ sentinel 的精简版本：
 
 在飞书里发消息，远程操控你电脑上的 Claude Code：
 
-- **飞书双向通信**：发消息 + 接收回复，支持文本/图片/文件收发
+- **飞书双向通信**：发消息 + 接收回复，支持文本/图片/文件收发；多通道（多个飞书应用 = 多个 bot，环境变量即插即用）
 - **多会话隔离**：不同群/话题各自独立会话，互不干扰、互不阻塞
-- **流式卡片**：AI 回复实时更新到单张卡片
-- **Agent Teams**：多 Agent 协作
-- **稳定性**：WebSocket 断线自动重连、会话崩溃自动恢复、`service start` 一键注册系统服务（开机自启 + 崩溃自动重启）
+- **流式卡片 + 抹茶卡片体系**：AI 回复实时更新到单张卡片；工具调用可折叠压缩（长任务不刷屏）；Card 2.0 可点按钮/原生表格/审批卡/选项卡全套构件
+- **权限三代（意图级审批）**：红线直接拒 → 硬闸意图弹飞书审批卡（说人话不说命令）→ 其余放行 + 轮末执行摘要卡事后验收；删除走回收站免审
+- **Agent Teams**：多 Agent 协作；**/ask 旁路询问**：观察员读实时轨迹答进度，不插话
+- **稳定性**：WebSocket 断线自动重连、会话崩溃自动恢复、飞书断网凭证重试自愈、出站退避重试、`service start` 一键注册系统服务（开机自启 + 崩溃自动重启）
 
 **前置条件**：Node.js 18+、一个飞书自建应用（机器人），支持 Windows / macOS / Linux
 

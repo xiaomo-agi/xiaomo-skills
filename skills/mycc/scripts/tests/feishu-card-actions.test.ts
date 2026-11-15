@@ -32,8 +32,18 @@ function cleanPersistedState() {
 
 /** 从 1.0 卡片里抽出所有按钮（展开 action 模块） */
 function extractButtons(card: Record<string, unknown>): any[] {
-  const elements = (card as any).elements as any[];
-  return elements.filter((e) => e.tag === "action").flatMap((e) => e.actions);
+  const out: any[] = [];
+  const strip = (s: string) => String(s).replace(/<[^>]+>/g, "").replace(/\*\*/g, "");
+  const walk = (els: any[]) =>
+    els.forEach((e: any) => {
+      if (e.tag === "interactive_container" && Array.isArray(e.behaviors)) {
+        out.push({ text: { content: strip(e.elements?.[0]?.content ?? "") }, value: e.behaviors[0].value });
+      }
+      if (Array.isArray(e.elements)) walk(e.elements);
+      if (Array.isArray(e.columns)) e.columns.forEach((c: any) => walk(c.elements ?? []));
+    });
+  walk(card.body?.elements ?? card.elements ?? []);
+  return out;
 }
 
 describe("parseCardCommandValue", () => {
@@ -70,7 +80,7 @@ describe("卡片构建器", () => {
     const buttons = extractButtons(card);
     expect(buttons).toHaveLength(4);
     for (const b of buttons) {
-      expect(b.tag).toBe("button");
+      // 2026-10-31 容器按钮：无 tag:button，value 结构不变
       expect(b.value.cmd).toBe("/model");
       expect(parseCardCommandValue(b.value)).not.toBeNull();
     }
@@ -106,18 +116,15 @@ describe("卡片构建器", () => {
       5
     );
     const buttons = extractButtons(card);
-    expect(buttons).toHaveLength(2);
-    expect(buttons[0].value).toEqual({ cmd: "/switch", arg: "1" });
-    expect(buttons[0].type).toBe("default");
-    expect(buttons[1].value).toEqual({ cmd: "/switch", arg: "2" });
-    expect(buttons[1].type).toBe("primary");
+    expect(buttons).toHaveLength(1); // 当前会话不出按钮（只保留说明行）
+    expect(buttons[0].value).toEqual({ cmd: "/switch", arg: "2" });
   });
 
   it("confirmActionCard：危险按钮 + /noop 取消按钮", () => {
     const card = confirmActionCard("确定要杀掉进程吗？", "确认杀掉", { cmd: "/status" });
     const buttons = extractButtons(card);
     expect(buttons).toHaveLength(2);
-    expect(buttons[0].type).toBe("danger");
+    expect(JSON.stringify(card)).toContain("<font color='red'>");
     expect(buttons[1].value).toEqual({ cmd: "/noop" });
   });
 });

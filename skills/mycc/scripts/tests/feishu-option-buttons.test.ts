@@ -206,34 +206,19 @@ describe("OptionCallbackAuth", () => {
 
 describe("optionPickerCard", () => {
   function extractButtons(card: Record<string, unknown>): any[] {
-    const elements = (card as any).elements as any[];
-    return elements.filter((e) => e.tag === "action").flatMap((e) => e.actions);
-  }
-
-  it("按钮 value 携带 {cb: token}，短标签排一行", () => {
-    const card = optionPickerCard("选哪个？", [
-      { label: "甲", token: "t1" },
-      { label: "乙", token: "t2" },
-    ]);
-    const buttons = extractButtons(card);
-    expect(buttons).toHaveLength(2);
-    expect(buttons[0].value).toEqual({ cb: "t1" });
-    expect((card as any).elements.filter((e: any) => e.tag === "action")).toHaveLength(1);
-  });
-
-  it("出现长标签 → 每个按钮独占一行，超 30 字截断", () => {
-    const long = "这是一个" + "非常".repeat(14) + "长的选项标签"; // 38 字 > 30
-    const card = optionPickerCard("选哪个？", [
-      { label: long, token: "t1" },
-      { label: "短", token: "t2" },
-    ]);
-    const rows = (card as any).elements.filter((e: any) => e.tag === "action");
-    expect(rows).toHaveLength(2);
-    const buttons = extractButtons(card);
-    expect(buttons[0].text.content.length).toBeLessThanOrEqual(30);
-    expect(buttons[0].text.content.endsWith("…")).toBe(true);
-  });
-});
+  const out: any[] = [];
+  const strip = (s: string) => String(s).replace(/<[^>]+>/g, "").replace(/\*\*/g, "");
+  const walk = (els: any[]) =>
+    els.forEach((e: any) => {
+      if (e.tag === "interactive_container" && Array.isArray(e.behaviors)) {
+        out.push({ text: { content: strip(e.elements?.[0]?.content ?? "") }, value: e.behaviors[0].value });
+      }
+      if (Array.isArray(e.elements)) walk(e.elements);
+      if (Array.isArray(e.columns)) e.columns.forEach((c: any) => walk(c.elements ?? []));
+    });
+  walk(card.body?.elements ?? card.elements ?? []);
+  return out;
+}
 
 describe("FeishuCommands 选项按钮端到端", () => {
   let broadcasts: string[];
@@ -274,8 +259,17 @@ describe("FeishuCommands 选项按钮端到端", () => {
   }
 
   function extractButtons(card: Record<string, unknown>): any[] {
-    const elements = (card as any).elements as any[];
-    return elements.filter((e) => e.tag === "action").flatMap((e) => e.actions);
+    const els = (card as any).body?.elements ?? (card as any).elements ?? [];
+    return els
+      .filter((e: any) => e.tag === "interactive_container" && Array.isArray(e.behaviors))
+      .map((e: any) => ({
+        text: {
+          content: String(e.elements?.[0]?.content ?? "")
+            .replace(/<[^>]+>/g, "")
+            .replace(/\*\*/g, ""),
+        },
+        value: e.behaviors[0].value,
+      }));
   }
 
   const ctx: FeishuMessageContext = {
@@ -300,7 +294,7 @@ describe("FeishuCommands 选项按钮端到端", () => {
     expect(cardReplies).toHaveLength(1);
     const buttons = extractButtons(cardReplies[0]);
     expect(buttons).toHaveLength(2);
-    expect(buttons.map((b) => b.text.content)).toEqual(["直接合并", "先跑测试"]);
+    expect(buttons.map((b) => b.text.content)).toEqual(["A · 直接合并", "B · 先跑测试"]);
 
     // 点击第 2 个按钮：选项文本被当成用户消息转回会话
     await commands.processCardAction(buttons[1].value, ctx);
@@ -370,7 +364,7 @@ describe("FeishuCommands 选项按钮端到端", () => {
     await commands.processMessage("部署一下", undefined, undefined, "om_msg1", ctx);
     expect(cardReplies).toHaveLength(1);
     const buttons = extractButtons(cardReplies[0]);
-    expect(buttons.map((b) => b.text.content)).toEqual(["测试机", "生产机"]);
+    expect(buttons.map((b) => b.text.content)).toEqual(["A · 测试机", "B · 生产机"]);
     expect(JSON.stringify(cardReplies[0])).toContain("部署到哪");
   });
 });

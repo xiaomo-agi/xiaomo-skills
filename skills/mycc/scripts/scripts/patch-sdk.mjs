@@ -1,50 +1,24 @@
 #!/usr/bin/env node
 /**
- * Patch SDK: 修复已知的 SDK / CLI bug
+ * Patch SDK: 修复已知的 CLI bug
  *
- * Patch 1: sdk.mjs — settingSources 硬编码
- *   问题：settingSources:[] 导致 v2 Session 不加载 CLAUDE.md / Skills
- *   修复：settingSources:X.settingSources??["user","project"]
- *
- * Patch 2: cli.js — lP 函数不检查 isIdle（Agent Teams 死锁）
+ * Patch: cli.js — lP 函数不检查 isIdle（Agent Teams 死锁）
  *   问题：do-while 主循环用 lP 判断 task 是否活跃，不检查 isIdle
  *         → idle 的 teammate 被当成活跃 → 循环永不退出 → inbox 轮询永不执行
  *   修复：在 lP 返回 true 前加 if(A.isIdle)return!1
+ *
+ * 历史：曾有 Patch 1 改写 sdk.mjs 的 settingSources:[] 硬编码（否则 v2 Session
+ * 不加载 CLAUDE.md / Skills）。SDK 0.2.141 起提供官方 settingSources 字段，
+ * 改由 official.ts buildSessionOptions 显式传入 ["user","project"]，
+ * sdk.mjs 补丁移除（2026-07-07，审查 H2 闭环）。
  *
  * 用法：node scripts/patch-sdk.mjs
  *       或通过 npm postinstall 自动执行
  */
 
 import { readFileSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const SDK_DIR = join(__dirname, "..", "node_modules", "@anthropic-ai", "claude-agent-sdk");
-const SDK_PATH = join(SDK_DIR, "sdk.mjs");
-
-// ============ Patch 1: sdk.mjs — settingSources ============
-
-const SETTINGS_ORIGINAL = "settingSources:[]";
-const SETTINGS_PATCHED = 'settingSources:X.settingSources??["user","project"]';
-
-try {
-  const source = readFileSync(SDK_PATH, "utf-8");
-
-  if (source.includes(SETTINGS_PATCHED)) {
-    console.log("[patch-sdk] sdk.mjs: settingSources already patched.");
-  } else if (!source.includes(SETTINGS_ORIGINAL)) {
-    console.warn("[patch-sdk] sdk.mjs: settingSources pattern not found (SDK may have fixed it).");
-  } else {
-    const patched = source.replace(SETTINGS_ORIGINAL, SETTINGS_PATCHED);
-    writeFileSync(SDK_PATH, patched, "utf-8");
-    console.log("[patch-sdk] sdk.mjs: patched settingSources:[] → settingSources:X.settingSources??[\"user\",\"project\"]");
-  }
-} catch (err) {
-  console.error("[patch-sdk] sdk.mjs patch failed:", err.message);
-}
-
-// ============ Patch 2: cli.js — lP 函数 isIdle 检查 ============
+// ============ Patch: cli.js — lP 函数 isIdle 检查 ============
 // CLI 2.1.63 的 lP 不检查 isIdle，导致 Agent Teams do-while 死锁
 
 import { execSync } from "child_process";

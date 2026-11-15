@@ -14,8 +14,10 @@ import type { CCAdapter } from "../adapters/interface.js";
 import { getAdapter, isValidProvider, listRegisteredProviders, type AgentProvider } from "../adapters/index.js";
 import type { ChannelManager } from "./manager.js";
 import type { DeviceConfig } from "../types.js";
-import type { FeishuStreamingSession } from "./feishu-streaming.js";
+import type { FeishuStreamingSession, MarkdownCardBlock } from "./feishu-streaming.js";
+import { markdownCardBlocksToText } from "./feishu-streaming.js";
 import type { FeishuMessageContext } from "./feishu.js";
+import type { ApprovalCardHandle } from "../permissions/approval.js";
 import { listSkills } from "../skills.js";
 import fs from "fs";
 import path from "path";
@@ -128,10 +130,15 @@ interface ScopeProcessing {
   startedAt: number;
   lastToolName?: string;
   lastToolAt?: number;
+  /** 旁路询问(/ask)观察员数据：最近工具轨迹 + 正在生成的回复尾部 */
+  recentTools?: string[];
+  lastTextTail?: string;
   /** 上次在卡片上显示"仍在工作"心跳提示的时间，用于节流，避免长时间等待时刷屏 */
   lastHeartbeatShownAt?: number;
   /** /stop 已对本回合发出终止指令的时间——收尾状态行据此显示 🛑 而不是 ✅/❌ */
   interruptedAt?: number;
+  /** 上次因流事件刷新空闲兜底计时器的时间（touchProcessing 节流用） */
+  lastTouchAt?: number;
   unlockTimer: ReturnType<typeof setTimeout>;
 }
 
@@ -147,6 +154,10 @@ export class FeishuCommands {
   private agentProviders = new Map<string, AgentProvider>();
   /** 关闭了流式输出的 scope 集合（只存关闭项，无记录=开启，行为零变化） */
   private streamOffScopes = new Set<string>();
+  /** scope → 飞书审批句柄（09-06 串卡修复）：审批卡只发本 scope 的聊天。
+   *  每条消息进来时刷新本 scope 的句柄，经 chatWithSessionRecovery 带入 adapter，
+   *  会话创建时闭包进 canUseTool。 */
+  private approvalHandles = new Map<string, ApprovalCardHandle>();
   /**
    * `${scope}::${provider}` → sessionId 暂存。
    * 切换供应商时把当前会话按旧供应商暂存，切回时恢复——claude 的 sessionId 是
@@ -157,11 +168,37 @@ export class FeishuCommands {
   private providerSessionStash = new Map<string, string>();
   /** scope → 处理状态（存在即表示"正在处理中"） */
   private processingScopes = new Map<string, ScopeProcessing>();
+  /**
+   * scope → 处理锁占用期间到达的消息排队（2026-10-26 从"仅媒体暂存"升级为统一队列）。
+   * 旧逻辑纯文字直接拒绝丢弃——用户连发修订 v2/v3 被拒，agent 只答抢到锁的旧版
+   * （10-25 X bio 修订滞后根因）。现在文字+媒体一律按序入队，回合结束逐条自动续跑。
+   */
+  private pendingQueueByScope = new Map<string, Array<{
+    text: string;
+    images?: Array<{ data: string; mediaType: string }>;
+    files?: Array<{ filePath: string; fileName: string }>;
+    messageId?: string;
+    ctx?: FeishuMessageContext;
+  }>>();
+  /** 单 scope 排队上限，超限拒绝新增（防异常场景无限积压） */
+  private static readonly MAX_PENDING_QUEUE = 10;
+  /** scope → 上次发排队提示卡的时间（30s 节流，连发多条只提示一次不刷屏，学 Hermes busy ack） */
+  private lastQueueNoticeAt = new Map<string, number>();
+  private static readonly QUEUE_NOTICE_GAP_MS = 30_000;
+  /** /model 切换时正在跑回合的 scope：回合结束后再驱逐重建 session，避免中途杀任务 */
+  private pendingModelEvictions = new Set<string>();
   /** 劫持用的回复通道（群路由时用） */
   private replyChannel: any = null;
   /** 小工身份名称（群聊路由时用于身份标识） */
   agentName: string = "";
-  private processingTimeoutMs = 120_000; // 2分钟超时自动解锁
+  /**
+   * 处理锁空闲兜底解锁：连续这么久没有任何流事件才判定回合已死、清掉残留锁。
+   * 正常回合由 processMessage 的 finally 释放；adapter 侧心跳约 15 秒一次、
+   * 轮间超时 15 分钟（BETWEEN_TURN_TIMEOUT_MS），任务活着就不可能 20 分钟无事件。
+   * 绝不能按固定时长解锁——2026-07-06 复盘：旧实现固定 2 分钟强制删锁且从不刷新，
+   * 长任务锁提前蒸发，/stop 报"无任务"、/status 谎报空闲、并发保护全部失效。
+   */
+  private processingIdleTimeoutMs = 20 * 60_000;
 
   constructor(deps: FeishuCommandsDeps) {
     this.deps = deps;
@@ -305,6 +342,20 @@ export class FeishuCommands {
   ): Promise<void> {
     const scope = ctx?.scope || DEFAULT_SCOPE;
 
+    // 审批句柄注册（2026-09-06 串卡修复）：按 scope 记录，随消息带入 adapter，
+    // 会话创建时闭包进 canUseTool——审批卡只发本条消息的来源聊天。
+    // 旧版是模块级全局 cardSender，所有 bot 共跑一个后端进程，全局被
+    // 「最近一条被处理的消息」反复覆盖，多 bot 并发时审批卡发错聊天。
+    const approvalChatId = ctx?.chatId;
+    const approvalChannel = this.effectiveChannel;
+    if (approvalChannel && approvalChatId) {
+      this.approvalHandles.set(scope, {
+        scope,
+        sendCard: (card) => approvalChannel.sendInteractiveCard(approvalChatId, card, "chat_id"),
+        replyCard: (messageId, card) => approvalChannel.sendCardReply(messageId, card),
+      });
+    }
+
     // /status、/stop 不受处理锁限制：正在干活时也能随时查询进度/紧急终止
     const lockFreeCmd = message.trim().toLowerCase();
     if (lockFreeCmd.startsWith("/status")) {
@@ -318,21 +369,72 @@ export class FeishuCommands {
 
     // 并发锁（按 scope）：同一会话串行，不同群/话题互不阻塞
     if (this.processingScopes.has(scope)) {
-      console.warn(`[CC] ⚠ scope ${scope} 正在处理中，拒绝新消息: ${message.substring(0, 30)}...`);
-      const busyText = `上一条消息还在处理中${this.describeProgress(scope)}，请稍等。`;
-      // 优先出带终止按钮的卡片，通道不支持时回退纯文本
-      if (!(await this.sendCardToFeishu(processingNoticeCard(busyText), ctx))) {
-        await this.sendToFeishu(`${busyText}\n\n随时发 /status 查看进度，发 /stop 紧急终止。`, ctx);
+      const hasMedia = (images && images.length > 0) || (files && files.length > 0);
+
+      // 优先尝试把纯文字作为补充信息注入正在跑的回合（2026-10-26 P1，学 Hermes steer）：
+      // CLI 在当前步骤完成后吸收它、任务连续跑完才解锁——"任务跑一半补一句话"的正解。
+      // 注入失败（回合收线/session 不在池/codex 不支持）自动落到下方排队，零丢失。
+      // 图片/文件不注入：stdin 注入媒体结构复杂，继续走排队（媒体本来就有暂存路径）。
+      // 旁路询问（2026-10-31）：/ask 不插话，走独立观察员——主任务零打扰
+      if (!hasMedia && message.trim().toLowerCase().startsWith("/ask")) {
+        const question = message.trim().replace(/^\/ask\s*/i, "").trim();
+        await this.handleAsk(scope, question, ctx);
+        return;
+      }
+
+      const boundSession = this.getSession(scope);
+      if (!hasMedia && message.trim() && boundSession) {
+        let steered = false;
+        try {
+          steered = await this.adapterFor(scope).steerSession(boundSession, message.trim());
+        } catch (err) {
+          console.warn(`[CC] ⚠ steer 注入异常（降级排队）:`, err);
+        }
+        if (steered) {
+          console.log(`[CC] 🧭 scope ${scope} 补充信息已并入当前任务: ${message.substring(0, 30)}...`);
+          // 轻提示 30s 节流（复用排队提示节流器）：连续补充只提示一次
+          const lastNotice = this.lastQueueNoticeAt.get(scope) || 0;
+          if (Date.now() - lastNotice > FeishuCommands.QUEUE_NOTICE_GAP_MS) {
+            this.lastQueueNoticeAt.set(scope, Date.now());
+            const notice = `当前任务还在跑，你补充的话已并入任务（当前步骤完成后生效），不用重发。`;
+            if (!(await this.sendCardToFeishu(processingNoticeCard(notice), ctx))) {
+              await this.sendToFeishu(notice, ctx);
+            }
+          }
+          return;
+        }
+      }
+
+      // 降级路径：按序入队（2026-10-26：此前纯文字直接拒绝丢弃，
+      // 连发修订 v2/v3 被拒 = 内容丢失、agent 只答旧版；排队后逐条续跑，零丢失）
+      if (!message.trim() && !hasMedia) return; // 空消息不入队
+      const queue = this.pendingQueueByScope.get(scope) || [];
+      if (queue.length >= FeishuCommands.MAX_PENDING_QUEUE) {
+        const overflowText = `排队消息已达上限（${FeishuCommands.MAX_PENDING_QUEUE} 条），本条未被接收，请等当前任务结束后再发。`;
+        console.warn(`[CC] ⚠ scope ${scope} 排队超限，拒绝: ${message.substring(0, 30)}...`);
+        if (!(await this.sendCardToFeishu(processingNoticeCard(overflowText), ctx))) {
+          await this.sendToFeishu(overflowText, ctx);
+        }
+        return;
+      }
+      queue.push({ text: message.trim(), images, files, messageId, ctx });
+      this.pendingQueueByScope.set(scope, queue);
+      const mediaNote = hasMedia ? ` [${images?.length || 0} 图, ${files?.length || 0} 文件]` : "";
+      console.log(`[CC] 📥 scope ${scope} 处理中，消息入队（第 ${queue.length} 位）${mediaNote}: ${message.substring(0, 30)}...`);
+      // 排队提示卡 30s 节流：连发多条只提示一次
+      const lastNotice = this.lastQueueNoticeAt.get(scope) || 0;
+      if (Date.now() - lastNotice > FeishuCommands.QUEUE_NOTICE_GAP_MS) {
+        this.lastQueueNoticeAt.set(scope, Date.now());
+        const notice = `上一条消息还在处理中${this.describeProgress(scope)}\n\n你的消息已排队（当前第 ${queue.length} 位），处理完自动继续。\n随时发 /status 查看进度，发 /stop 紧急终止。`;
+        if (!(await this.sendCardToFeishu(processingNoticeCard(notice), ctx))) {
+          await this.sendToFeishu(notice, ctx);
+        }
       }
       return;
     }
-    const unlockTimer = setTimeout(() => {
-      if (this.processingScopes.has(scope)) {
-        console.error(`[CC] ⚠ scope ${scope} processMessage 超时自动解锁 (${this.processingTimeoutMs}ms)`);
-        this.processingScopes.delete(scope);
-      }
-    }, this.processingTimeoutMs);
-    this.processingScopes.set(scope, { startedAt: Date.now(), unlockTimer });
+    const processingEntry = { startedAt: Date.now() } as ScopeProcessing;
+    processingEntry.unlockTimer = this.scheduleIdleUnlock(scope, processingEntry);
+    this.processingScopes.set(scope, processingEntry);
     console.log(`[CC] 🔒 处理锁已锁定 (scope=${scope})`);
 
     try {
@@ -416,13 +518,65 @@ export class FeishuCommands {
   } catch (err) {
     console.error(`[CC] processMessage 未捕获错误:`, err);
   } finally {
-    clearTimeout(unlockTimer);
-    if (this.processingScopes.has(scope)) {
+    clearTimeout(processingEntry.unlockTimer);
+    // 只释放本回合自己创建的锁：锁若已被兜底解锁且新回合重新上锁，
+    // 无条件 delete 会误删新回合的锁，并发守卫级联失效
+    if (this.processingScopes.get(scope) === processingEntry) {
       console.log(`[CC] 🔓 处理锁已解锁 (scope=${scope})`);
       this.processingScopes.delete(scope);
+      // 解锁后自动续跑排队消息（排队零丢失的另一半）
+      this.drainPendingQueue(scope);
+    }
+    // /model 在本 scope 回合进行中到达时的延迟驱逐：回合结束后再重建 session
+    if (this.pendingModelEvictions.delete(scope)) {
+      const sid = this.convSessions.get(scope);
+      if (sid && this.currentProvider(scope) === "claude") {
+        try {
+          this.adapterFor(scope).closeSession(sid);
+          console.log(`[CC] 回合结束，延迟驱逐 session 使新模型生效: ${sid} (scope=${scope})`);
+        } catch { /* 驱逐失败不影响回合收尾，session 过期后自然重建 */ }
+      }
     }
   }
 }
+
+  /**
+   * 续跑排队消息：shift 一条重新走完整 processMessage（含抢锁），
+   * 其 finally 再续跑下一条——队列按序逐条消化（FIFO 语义，不合并消息边界）。
+   * fire-and-forget：回合 finally 与兜底解锁共用；续跑失败由 processMessage 自己兜。
+   */
+  private drainPendingQueue(scope: string): void {
+    const queue = this.pendingQueueByScope.get(scope);
+    if (!queue || queue.length === 0) return;
+    const next = queue.shift()!;
+    if (queue.length === 0) this.pendingQueueByScope.delete(scope);
+    const preview = next.text ? next.text.substring(0, 30) : "[媒体]";
+    console.log(`[CC] ▶️ 续跑排队消息 (scope=${scope}, 剩余 ${queue.length} 条): ${preview}...`);
+    void this.processMessage(next.text, next.images, next.files, next.messageId, next.ctx);
+  }
+
+  /** 空闲兜底解锁计时器：触发时只清理自己对应的锁条目（锁可能已释放并被新回合重新占用） */
+  private scheduleIdleUnlock(scope: string, entry: ScopeProcessing): ReturnType<typeof setTimeout> {
+    return setTimeout(() => {
+      if (this.processingScopes.get(scope) === entry) {
+        console.error(`[CC] ⚠ scope ${scope} 连续 ${this.processingIdleTimeoutMs}ms 无任何流事件，判定回合已死，兜底解锁`);
+        this.processingScopes.delete(scope);
+        // 回合已死不会再走 finally：这里接力续跑排队消息，否则搁浅无人处理
+        this.drainPendingQueue(scope);
+      }
+    }, this.processingIdleTimeoutMs);
+  }
+
+  /** 流事件到达时刷新空闲兜底计时器：任务只要活着（含心跳）锁就不超时。5 秒节流避免高频重建定时器 */
+  private touchProcessing(scope: string): void {
+    const p = this.processingScopes.get(scope);
+    if (!p) return;
+    const now = Date.now();
+    if (p.lastTouchAt && now - p.lastTouchAt < 5_000) return;
+    p.lastTouchAt = now;
+    clearTimeout(p.unlockTimer);
+    p.unlockTimer = this.scheduleIdleUnlock(scope, p);
+  }
 
   /**
    * 处理卡片按钮点击（Phase 5）：把按钮 value 里的 {cmd, arg} 拼回命令字符串，
@@ -549,7 +703,7 @@ export class FeishuCommands {
     if (!channel) return false;
 
     if (ctx?.messageId && typeof channel.sendCardReply === "function") {
-      const ok = await channel.sendCardReply(ctx.messageId, card);
+      const ok = await channel.sendCardReply(ctx.messageId, card, ctx.chatId);
       if (ok) return true;
     }
 
@@ -558,7 +712,8 @@ export class FeishuCommands {
         ? { receiveId: ctx.chatId, receiveIdType: "chat_id" as const }
         : channel.getReplyTarget?.();
       if (target) {
-        return await channel.sendInteractiveCard(target.receiveId, card, target.receiveIdType);
+        // sendInteractiveCard 现在返回 message_id（09-06 审批状态回写），此处只关心成败
+        return !!(await channel.sendInteractiveCard(target.receiveId, card, target.receiveIdType));
       }
     }
     return false;
@@ -599,7 +754,9 @@ export class FeishuCommands {
           : feishuChannel.getReplyTarget?.();
         if (cfg.appId && cfg.appSecret && target) {
           const session = feishuChannel.createStreamingSession();
-          await session.start(target.receiveId, target.receiveIdType, messageId);
+          // 2026-10-31 owner：不引用原消息（引用框把排版搞乱），直接发进会话；
+          // 路由已由 receiveId 保证，无需 reply 挂靠
+          await session.start(target.receiveId, target.receiveIdType);
           streamingSession = session;
           console.log(`[CC] 流式卡片已启动 (scope=${scope})`);
         }
@@ -614,19 +771,32 @@ export class FeishuCommands {
     let replyText = "";
     // AskUserQuestion 工具事件里的结构化选项，优先于文本启发式
     let askOptions: DetectedOptions | null = null;
+    // 会话绑定只认本回合首个 system 事件（与 adapter 层 extractSessionId 语义对齐）：
+    // Teams/subagent 的 system 事件带着子会话的 session_id 晚于主会话 init 到达，
+    // 逐个都绑会把 scope 绑定劫持到子会话上并持久化——/stop 找不到主任务、
+    // 下一条消息聊进子会话、错误绑定跨重启存活（2026-07-06 审查问题 #3/M1）
+    let sessionBoundThisTurn = false;
     try {
       for await (const data of stream) {
         if (!data || typeof data !== "object") continue;
+        // 任何流事件（含心跳）都说明任务还活着，刷新处理锁的空闲兜底计时器
+        this.touchProcessing(scope);
 
-        if (data.type === "system" && "session_id" in data) {
+        if (data.type === "system" && "session_id" in data && !sessionBoundThisTurn) {
+          sessionBoundThisTurn = true;
           this.bindSession(scope, data.session_id as string);
         }
 
         if (streamingSession) {
           // 流式卡片模式：收集文本并实时更新
+          const stashTail = () => {
+            const p = this.processingScopes.get(scope);
+            if (p) p.lastTextTail = accumulatedText.slice(-600);
+          };
           if (data.type === "text" && data.text) {
             accumulatedText += String(data.text);
             replyText += String(data.text);
+            stashTail();
             await streamingSession.update(accumulatedText);
           } else if (data.type === "assistant") {
             const content = (data as any).message?.content;
@@ -642,6 +812,18 @@ export class FeishuCommands {
                   if (feishuChannel?.getConfig?.()?.showToolUse !== false) {
                     // 实时展示工具调用，让用户知道 AI 正在干什么
                     accumulatedText += this.noteToolUse(block, scope);
+                    // 方案B：结构化记录，close() 收尾时渲染成折叠面板
+                    const toolName = String(block.name || "unknown");
+                    const detail = block.input
+                      ? "```json\n" +
+                        JSON.stringify(block.input, null, 1).slice(0, 600) +
+                        "\n```"
+                      : "";
+                    streamingSession?.addToolCall(
+                      toolName,
+                      toolUseLine(toolName, block.input).trim(),
+                      detail
+                    );
                   }
                 }
               }
@@ -691,11 +873,24 @@ export class FeishuCommands {
                     askOptions = askOptions ?? extractAskUserQuestionOptions(block.input);
                   }
                   this.noteToolUse(block, scope); // 记录状态供 /status 查询
-                  const name = block.name || "unknown";
+                  const name = String(block.name || "unknown");
                   const summary = summarizeToolInput(name, block.input, 200);
-                  const toolCallText = `**使用工具: ${name}**${summary ? `\n\`${summary}\`` : ""}`;
+                  // 方案A：工具调用发成 blocks，静态卡渲染为 collapsible_panel
+                  // （收起态短条「🔧 工具名」，长摘要/入参放面板内容里）
+                  const toolCallBlocks: MarkdownCardBlock[] = [
+                    {
+                      type: "tool",
+                      name,
+                      line: `**使用工具: ${name}**${summary ? `\n\`${summary}\`` : ""}`,
+                      detail: block.input
+                        ? "```json\n" +
+                          JSON.stringify(block.input, null, 1).slice(0, 600) +
+                          "\n```"
+                        : "",
+                    },
+                  ];
                   console.log(`[CC] 发送工具调用: ${name}`);
-                  await this.sendToFeishu(toolCallText, ctx);
+                  await this.sendToFeishu(toolCallBlocks, ctx);
                 }
               }
             }
@@ -703,12 +898,12 @@ export class FeishuCommands {
         }
       }
 
-      // 收尾：流式卡片末尾追加状态行再定格（用户不用猜"跑完了没"）；
-      // 批量模式此刻才一次性发送完整回复（消息到达本身就是完成信号，不加状态行）
+      // 收尾：完成状态在抬头条/KPI 行呈现（№9），正文不再追"✅ 已完成·耗时"（重复，2026-10-31 owner）；
+      // stopped/error 仍带文字状态行（语义不同）。批量模式消息到达本身就是完成信号
       const stoppedByUser = !!this.processingScopes.get(scope)?.interruptedAt;
       const statusLine = this.turnStatusLine(stoppedByUser ? "stopped" : "done", startedAt);
       if (streamingSession) {
-        await streamingSession.close(withStatusLine(accumulatedText, statusLine));
+        await streamingSession.close(accumulatedText, stoppedByUser ? "stopped" : "done");
       } else if (batchMode && (replyText || stoppedByUser)) {
         await this.sendToFeishu(stoppedByUser ? withStatusLine(replyText, statusLine) : replyText, ctx);
       }
@@ -734,7 +929,9 @@ export class FeishuCommands {
         const finalText = stoppedByUser
           ? withStatusLine(accumulatedText, statusLine)
           : `${appendErrorNotice(accumulatedText, opts.errorNotice)}\n${statusLine}`;
-        await streamingSession.close(finalText).catch(() => {});
+        await streamingSession
+          .close(finalText, stoppedByUser ? "stopped" : "error")
+          .catch(() => {});
       } else if (stoppedByUser) {
         await this.sendToFeishu(withStatusLine(batchMode ? replyText : "", statusLine), ctx);
       } else if (batchMode && replyText) {
@@ -747,6 +944,64 @@ export class FeishuCommands {
       if (feishuChannel) {
         await feishuChannel.clearTypingIndicator(ctx?.messageId);
       }
+    }
+  }
+
+  /**
+   * 旁路询问（2026-10-31）：/ask <问题> —— 独立观察员读实时轨迹回答进度，
+   * 不插话不进主任务（插话走 steer，分工见 docs/20261031_mycc旁路询问ask命令方案.md）。
+   * 轨迹源 = processingScopes 的 recentTools/lastTextTail/startedAt/队列。
+   */
+  private lastAskAt = new Map<string, number>();
+
+  private async handleAsk(scope: string, question: string, ctx?: FeishuMessageContext): Promise<void> {
+    // 5s 频控：防连点刷观察员
+    const last = this.lastAskAt.get(scope) || 0;
+    if (Date.now() - last < 5_000) {
+      await this.sendToFeishu("刚问过啦，观察员还在看，5 秒后再问。", ctx);
+      return;
+    }
+    this.lastAskAt.set(scope, Date.now());
+
+    const p = this.processingScopes.get(scope);
+    if (!p) {
+      await this.sendToFeishu("当前没有正在跑的任务，没什么可汇报的。\n发 /status 看历史状态，或直接派活。", ctx);
+      return;
+    }
+
+    const elapsed = this.formatElapsed(Date.now() - p.startedAt);
+    const tools = (p.recentTools ?? []).length
+      ? (p.recentTools ?? []).map((l) => `- ${l}`).join("\n")
+      : "- （还没有工具调用记录）";
+    const tail = p.lastTextTail ? `正在生成的回复尾部：\n${p.lastTextTail}` : "（还没有文本输出）";
+    const queueLen = (this.pendingQueueByScope.get(scope) || []).length;
+
+    const prompt =
+      `你是 mycc 的任务观察员。主任务正在运行，主人想旁路问一句进度。\n` +
+      `根据下面的实时轨迹，用中文口语回答主人的问题。要求：\n` +
+      `- 只描述轨迹里能看到的进度，不执行任何操作，不编造轨迹外的内容\n` +
+      `- 两三句话说完，直接回答问题\n\n` +
+      `【运行状态】已运行 ${elapsed}；队列中还有 ${queueLen} 条待处理消息\n` +
+      `【最近工具轨迹】\n${tools}\n\n${tail}\n\n` +
+      `【主人的问题】${question || "现在干的怎么样了？"}`;
+
+    await this.sendToFeishu("🔎 旁路询问中……观察员正在看任务轨迹。", ctx);
+
+    try {
+      const { promisify } = await import("util");
+      const { execFile } = await import("child_process");
+      // 不钉模型名（2026-11-04）：钉 MiniMax 时切 spark 供应商即 400 断线（同 hermes cron 钉子坑）。
+      // 省略 --model 让 claude CLI 读 settings.json 默认模型，观察员自动跟随当前供应商。
+      const { stdout } = await promisify(execFile)(
+        "claude",
+        ["-p", prompt],
+        { timeout: 90_000, maxBuffer: 1024 * 1024, cwd: this.deps.cwd }
+      );
+      const answer = stdout.trim() || "（观察员没说话，轨迹可能太少了）";
+      await this.sendToFeishu(`🔎 旁路询问 · 不进主任务\n\n${answer}`, ctx);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.sendToFeishu(`观察员掉线了：${msg.slice(0, 120)}。主任务不受影响，继续跑着。`, ctx);
     }
   }
 
@@ -803,7 +1058,9 @@ export class FeishuCommands {
   /** /status：查询当前 scope 是否在干活（不受处理锁限制） */
   private async handleStatus(scope: string, ctx?: FeishuMessageContext): Promise<void> {
     if (this.processingScopes.has(scope)) {
-      const busyText = `正在处理消息${this.describeProgress(scope)}。\n\n处理完会自动回复，请稍等。`;
+      const queued = this.pendingQueueByScope.get(scope)?.length || 0;
+      const queueNote = queued > 0 ? `\n\n后方还有 ${queued} 条排队消息，会按顺序自动处理。` : "";
+      const busyText = `正在处理消息${this.describeProgress(scope)}。\n\n处理完会自动回复，请稍等。${queueNote}`;
       if (!(await this.sendCardToFeishu(processingNoticeCard(busyText), ctx))) {
         await this.sendToFeishu(`⏳ ${busyText}\n\n发 /stop 可紧急终止。`, ctx);
       }
@@ -840,7 +1097,12 @@ export class FeishuCommands {
       const interrupted = await this.adapterFor(scope).interruptSession(sessionId);
       if (interrupted) {
         console.log(`[CC] 🛑 已打断会话 ${sessionId} (scope=${scope})`);
-        await this.sendToFeishu(`🛑 已发送终止指令${this.describeProgress(scope)}。\n\n任务会在当前步骤停下，会话保留，可以直接发下一条消息。`, ctx);
+        // 排队消息一并清空：紧急终止的意图是「别跑了」，留着只会继续跑她已不想要的内容
+        const queue = this.pendingQueueByScope.get(scope);
+        const dropped = queue ? queue.length : 0;
+        if (queue) this.pendingQueueByScope.delete(scope);
+        const queueNote = dropped > 0 ? `\n\n同时清除了 ${dropped} 条排队消息。` : "";
+        await this.sendToFeishu(`🛑 已发送终止指令${this.describeProgress(scope)}。\n\n任务会在当前步骤停下，会话保留，可以直接发下一条消息。${queueNote}`, ctx);
       } else {
         if (processing) delete processing.interruptedAt;
         await this.sendToFeishu("没找到正在运行的任务进程——可能刚好已经结束了。发 /status 确认一下。", ctx);
@@ -898,6 +1160,10 @@ export class FeishuCommands {
     if (p) {
       p.lastToolName = name;
       p.lastToolAt = Date.now();
+      // 旁路询问(/ask)观察员的轨迹源：最近 10 条工具行
+      if (!Array.isArray(p.recentTools)) p.recentTools = [];
+      p.recentTools.push(toolUseLine(name, block?.input).trim().slice(0, 120));
+      if (p.recentTools.length > 10) p.recentTools.splice(0, p.recentTools.length - 10);
     }
     return toolUseLine(name, block?.input);
   }
@@ -914,6 +1180,8 @@ export class FeishuCommands {
     // 回合开始时解析一次 adapter，整个回合（含重试）固定用它，
     // 避免中途 /agent 切换导致 chat 和 closeSession 打到不同供应商
     const adapter = this.adapterFor(params.scope);
+    // 审批句柄按 scope 取（09-06 串卡修复）：会话创建时闭包进 canUseTool
+    const approvalHandle = this.approvalHandles.get(params.scope);
     try {
       for await (const data of adapter.chat({
         message: params.message,
@@ -921,6 +1189,7 @@ export class FeishuCommands {
         cwd: params.cwd,
         images: params.images,
         model: params.model,
+        approvalHandle,
       })) {
         yield data;
       }
@@ -938,6 +1207,7 @@ export class FeishuCommands {
         cwd: params.cwd,
         images: params.images,
         model: params.model,
+        approvalHandle,
       })) {
         yield data;
       }
@@ -1002,6 +1272,14 @@ export class FeishuCommands {
 
         case "/model":
           await this.handleModel(args[0], ctx);
+          break;
+
+        case "/change":
+          await this.handleChange(args, ctx);
+          break;
+
+        case "/ask":
+          await this.handleAsk(scope, args.join(" "), ctx);
           break;
 
         case "/agent":
@@ -1076,6 +1354,7 @@ export class FeishuCommands {
     try {
       const replyParts: string[] = [];
       let newSessionId: string | undefined;
+      let replied = false;
 
       for await (const data of this.adapterFor(scope).chat({
         message: title || "开始新对话",
@@ -1083,36 +1362,57 @@ export class FeishuCommands {
         model: this.modelFor(scope),
       })) {
         if (data && typeof data === "object") {
-          if (data.type === "system" && "session_id" in data) {
-            this.bindSession(scope, data.session_id as string);
+          this.touchProcessing(scope);
+          // 同 streamChatToFeishu：只认首个 system 事件，防 subagent 劫持绑定
+          if (data.type === "system" && "session_id" in data && !newSessionId) {
             newSessionId = data.session_id as string;
+            this.bindSession(scope, newSessionId);
             console.log(`[CC] 新会话已创建: ${newSessionId} (scope=${scope})`);
+            // 拿到会话 ID 即刻回复并打断引导回合：旧实现等"开始新对话"整轮跑完
+            // （CC 读全项目上下文，实测 90~290s）才回复，而引导回复本身没有价值，
+            // 白等还白烧 token。打断失败（SDK 内部结构变化）则走旧路径自然收尾。
+            await this.sendToFeishu(this.newSessionReplyText(newSessionId, title, replyParts), ctx);
+            replied = true;
+            try {
+              const interrupted = await this.adapterFor(scope).interruptSession(newSessionId);
+              console.log(`[CC] 引导回合已打断: interrupted=${interrupted} (session=${newSessionId})`);
+            } catch (e) {
+              console.warn(`[CC] 打断引导回合失败:`, e);
+            }
           }
           replyParts.push(...extractTextBlocks(data));
         }
       }
 
-      let response = "";
-      if (newSessionId) {
-        response = `新会话已创建\n\n`;
-        response += `会话 ID: ${newSessionId}\n`;
-        if (title) {
-          response += `标题: ${title}\n`;
-        }
-        response += `\n`;
+      if (!replied) {
+        await this.sendToFeishu(this.newSessionReplyText(newSessionId, title, replyParts), ctx);
       }
-
-      if (replyParts.length > 0) {
-        response += replyParts.join("").trim();
-      } else if (newSessionId) {
-        response += `现在发送的消息将使用此会话。`;
-      }
-
-      await this.sendToFeishu(response, ctx);
     } catch (err) {
       console.error(`[CC] 创建会话错误:`, err);
       await this.sendToFeishu("创建会话失败，请重试。", ctx);
     }
+  }
+
+  /** /new 的回复文案：绑定了会话给确认信息；没绑定（system 事件没来）退回旧文本路径 */
+  private newSessionReplyText(
+    newSessionId: string | undefined,
+    title: string | undefined,
+    replyParts: string[]
+  ): string {
+    if (!newSessionId) {
+      return replyParts.join("").trim() || "创建会话失败，请重试。";
+    }
+    let response = `新会话已创建\n\n会话 ID: ${newSessionId}\n`;
+    if (title) {
+      response += `标题: ${title}\n`;
+    }
+    response += `\n`;
+    if (replyParts.length > 0) {
+      response += replyParts.join("").trim();
+    } else {
+      response += `现在发送的消息将使用此会话。`;
+    }
+    return response;
   }
 
   private async handleListSessions(ctx?: FeishuMessageContext): Promise<void> {
@@ -1339,12 +1639,67 @@ export class FeishuCommands {
     // 下一条消息会走 resumeSession(sessionId, {model: 新模型}) 重新创建session对象，
     // 由于 sessionId 不变，CLI 会从持久化的历史记录里恢复对话内容，不丢历史。
     for (const [sessScope, sessionId] of this.convSessions) {
-      // 各 scope 可能绑在不同供应商上，驱逐必须用会话所属供应商的 adapter
+      // /model 只对 claude 生效：codex scope 不驱逐（旧实现会白白杀掉活跃 codex 子进程）
+      if (this.currentProvider(sessScope) !== "claude") continue;
+      // 正在跑回合的 scope 不能立刻驱逐——closeSession 会掐断任务，报错还会命中
+      // 恢复重试把整条消息重发（副作用重复执行）。标记起来，由该回合的 finally
+      // 在结束后驱逐重建，新模型从该 scope 的下一条消息起生效
+      if (this.processingScopes.has(sessScope)) {
+        this.pendingModelEvictions.add(sessScope);
+        continue;
+      }
       this.adapterFor(sessScope).closeSession(sessionId);
     }
 
     this.currentModel = resolved;
     await this.sendToFeishu(`已切换模型: ${resolved}\n\n下一条消息起生效。`, ctx);
+  }
+
+  /**
+   * /change 命令：切换 Claude Code 的供应商（minimax/glm/spark/星火）并自动重启 mycc。
+   * 2026-10-30 建：owner 要手机端一键换供应商。改配置与重启由
+   * ~/.local/bin/model-switch.sh 完成（内置活跃回合保护），这里只做调用与回复。
+   * 注意：脚本会延迟 4 秒重启本后端，回复必须在回到调用方之前 await 发出去。
+   */
+  private async handleChange(args: string[], ctx?: FeishuMessageContext): Promise<void> {
+    const ALIAS: Record<string, string> = {
+      "minimax": "minimax", "mm": "minimax",
+      "glm": "glm", "智谱": "glm",
+      "spark": "spark", "星火": "spark", "讯飞": "spark", "x2.6": "spark",
+    };
+
+    if (args.length === 0) {
+      let current = "未知";
+      try {
+        const s = JSON.parse(fs.readFileSync(path.join(process.env.HOME || "", ".claude", "settings.json"), "utf-8")) as { env?: Record<string, string> };
+        const base = s.env?.ANTHROPIC_BASE_URL || "";
+        current = base.includes("minimaxi") ? "minimax" : base.includes("bigmodel") ? "glm" : base.includes("xf-yun") ? "spark" : (base || "未知");
+      } catch {
+        // settings 读取失败就报未知，不阻塞查询
+      }
+      await this.sendToFeishu(
+        `当前供应商: ${current}\n\n用法: /change <minimax|glm|spark|星火>\n切换后 mycc 自动重启，约 1 分钟生效。`,
+        ctx
+      );
+      return;
+    }
+
+    const target = ALIAS[args[0].toLowerCase()] || args[0].toLowerCase();
+    if (!["minimax", "glm", "spark"].includes(target)) {
+      await this.sendToFeishu(`不认识的供应商: ${args[0]}\n用法: /change <minimax|glm|spark|星火>`, ctx);
+      return;
+    }
+
+    const script = path.join(process.env.HOME || "", ".local", "bin", "model-switch.sh");
+    const { promisify } = await import("util");
+    const { execFile } = await import("child_process");
+    try {
+      const { stdout } = await promisify(execFile)("bash", [script, target], { timeout: 15_000 });
+      await this.sendToFeishu(stdout.trim() || `已执行 /change ${target}`, ctx);
+    } catch (err) {
+      const out = err && typeof err === "object" && "stdout" in err ? String((err as { stdout?: string }).stdout || "") : "";
+      await this.sendToFeishu(out.trim() || `切换失败: ${err instanceof Error ? err.message : String(err)}`, ctx);
+    }
   }
 
   /**
@@ -1667,17 +2022,30 @@ export class FeishuCommands {
     }
   }
 
-  private async sendToFeishu(text: string, ctx?: FeishuMessageContext): Promise<void> {
+  private async sendToFeishu(content: string | MarkdownCardBlock[], ctx?: FeishuMessageContext): Promise<void> {
     // 使用 effectiveChannel（支持劫持）；通道不可用时回退到广播
     const channel = this.effectiveChannel;
     // 劫持模式下（群聊路由）自动加身份前缀
-    const finalText = (this.replyChannel && this.agentName)
-      ? `【${this.agentName}】\n${text}`
-      : text;
+    const prefix = this.replyChannel && this.agentName ? `【${this.agentName}】\n` : "";
+    const withPrefix = (body: string | MarkdownCardBlock[]): string | MarkdownCardBlock[] =>
+      prefix
+        ? typeof body === "string"
+          ? prefix + body
+          : [{ type: "text", content: prefix }, ...body]
+        : body;
+    // 降级通道（send/broadcast 只认 SSE 文本事件）统一拍平成文本
+    const flatten = (body: string | MarkdownCardBlock[]): string =>
+      typeof body === "string" ? body : markdownCardBlocksToText(body);
 
-    // 多会话：优先回复原消息（自动落在正确的群和话题里）
+    // 多会话：优先回复原消息（自动落在正确的群和话题里）。
+    // 飞书通道的 sendMarkdownReply 接受 blocks（方案A：工具调用渲染成折叠面板）；
+    // 其他通道实现若只认字符串，blocks 会被当作未知格式——这里先探测再传
     if (ctx?.messageId && channel && typeof channel.sendMarkdownReply === "function") {
-      const ok = await channel.sendMarkdownReply(ctx.messageId, finalText);
+      const payload =
+        typeof content !== "string" && !channel.acceptsMarkdownCardBlocks
+          ? flatten(withPrefix(content))
+          : withPrefix(content);
+      const ok = await channel.sendMarkdownReply(ctx.messageId, payload, ctx.chatId);
       if (ok) return;
       // 回复失败（消息被删等），降级走普通发送
     }
@@ -1687,7 +2055,7 @@ export class FeishuCommands {
         type: "assistant",
         message: {
           role: "assistant",
-          content: [{ type: "text", text: finalText }],
+          content: [{ type: "text", text: flatten(withPrefix(content)) }],
         },
       } as any);
     } else {
@@ -1695,7 +2063,7 @@ export class FeishuCommands {
         type: "assistant",
         message: {
           role: "assistant",
-          content: [{ type: "text", text }],
+          content: [{ type: "text", text: flatten(content) }],
         },
       } as any);
     }

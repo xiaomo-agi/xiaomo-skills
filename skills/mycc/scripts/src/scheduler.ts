@@ -21,7 +21,7 @@ export interface Task {
   name: string;
   skill: string;
   desc: string;
-  type: "daily" | "weekly" | "once" | "interval";
+  type: "daily" | "weekly" | "once" | "interval" | "monthly";
   activeHours?: { start: number; end: number }; // 活跃时段（小时），如 {start: 9, end: 24}
   sessionId?: string; // 指定 sessionId 可唤起已有对话
 }
@@ -125,14 +125,18 @@ function isValidTimeFormat(time: string): boolean {
     return interval > 0; // 间隔必须大于 0
   }
 
+  // 每月任务：每月X号/X日 HH:MM
+  if (/^每月\d{1,2}[号日]\s+\d{1,2}:\d{2}$/.test(time)) return true;
+
   return false;
 }
 
 /**
  * 检测任务类型
  */
-function detectTaskType(time: string): "daily" | "weekly" | "once" | "interval" {
+function detectTaskType(time: string): "daily" | "weekly" | "once" | "interval" | "monthly" {
   if (/^每\d+(分钟|m|小时|h)$/.test(time)) return "interval";
+  if (/^每月\d{1,2}[号日]/.test(time)) return "monthly";
   if (/^周[一二三四五六日]/.test(time)) return "weekly";
   if (/^\d{4}-\d{2}-\d{2}/.test(time)) return "once";
   return "daily";
@@ -163,6 +167,8 @@ export function matchTime(taskTime: string, now: Date): boolean {
       return matchOnceTime(taskTime, now);
     case "interval":
       return matchIntervalTime(taskTime, now);
+    case "monthly":
+      return matchMonthlyTime(taskTime, now);
     default:
       return false;
   }
@@ -244,6 +250,26 @@ function matchOnceTime(taskTime: string, now: Date): boolean {
 
   // 检查时间（带误差）
   return isWithinTolerance(taskHour, taskMinute, nowHour, nowMinute);
+}
+
+/**
+ * 匹配每月任务
+ * 格式：每月X号 HH:MM（号/日 均可）
+ * 注：若配置的号数大于当月最大天数（如 2 月配 30 号），该月不触发。
+ */
+function matchMonthlyTime(taskTime: string, now: Date): boolean {
+  const match = taskTime.match(/^每月(\d{1,2})[号日]\s+(\d{1,2}):(\d{2})$/);
+  if (!match) return false;
+
+  const taskDay = parseInt(match[1], 10);
+  const taskHour = parseInt(match[2], 10);
+  const taskMinute = parseInt(match[3], 10);
+
+  // 检查日期（几号）是否匹配
+  if (now.getDate() !== taskDay) return false;
+
+  // 检查时间（带误差）
+  return isWithinTolerance(taskHour, taskMinute, now.getHours(), now.getMinutes());
 }
 
 /**

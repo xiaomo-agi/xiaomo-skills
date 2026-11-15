@@ -17,6 +17,7 @@ import { listSkills } from "./skills.js";
 import { ChannelManager } from "./channels/manager.js";
 import { WebChannel } from "./channels/web.js";
 import { loadConfig } from "./config.js";
+import { isApprovalCardValue, handleApprovalCardAction } from "./permissions/approval.js";
 import { SessionStats } from "./session-stats.js";
 import { FeishuCommands } from "./channels/feishu-commands.js";
 import { resolveAgentDir, listAgents } from "./agent-resolver.js";
@@ -884,8 +885,13 @@ export class HttpServer {
               router.register(cfg.label.toLowerCase(), feishuCommands);
 
               // 卡片按钮点击 → 命令处理（Phase 5）。点击的一定是本 bot 自己
-              // 发的卡片，事件只会推给发卡片的应用，无需 mention 路由判断
+              // 发的卡片，事件只会推给发卡片的应用，无需 mention 路由判断。
+              // 审批卡按钮（value.__approval）优先分流，不进命令白名单
               feishuChannel.onCardAction(async (value: Record<string, unknown>, cardCtx: any) => {
+                if (isApprovalCardValue(value)) {
+                  handleApprovalCardAction(value);
+                  return;
+                }
                 await feishuCommands.processCardAction(value, cardCtx);
               });
 
@@ -909,14 +915,13 @@ export class HttpServer {
                   const isMentionMe = mentions?.some((m: any) => mentionIdEquals(m, botOpenId));
                   const hasAnyBotMention = mentions?.some((m: any) => !mentionIdEquals(m, "all") && !mentionIdEquals(m, "_all"));
 
-                  if (isMentionMe) {
-                    // @了本bot：直接处理
-                    await feishuCommands.processMessage(message, images, files, messageId, msgCtx);
-                  } else if (!hasAnyBotMention) {
-                    // 没@任何人：默认处理（私聊或无目标的消息）
+                  if (isMentionMe || !hasAnyBotMention) {
+                    // @了本bot 或 没@任何人：本bot处理。"正在输入"表态此时才亮，
+                    // 避免@了别人时本bot也亮一下"已读"（表态只在实际处理时出现）。
+                    if (messageId) feishuChannel.addTypingIndicator(messageId).catch(() => {});
                     await feishuCommands.processMessage(message, images, files, messageId, msgCtx);
                   } else {
-                    // @了其他bot：忽略
+                    // @了其他bot：忽略（不亮表态）
                     console.log(`[AgentRouter] 通道 ${cfg.label} 忽略（@了其他bot）`);
                   }
                 });
@@ -944,6 +949,7 @@ export class HttpServer {
             const mentions = msgCtx?.mentions ?? leader.channel.getLastMessageContext()?.mentions;
             const isAllMention = mentions?.some((m: any) => mentionIdEquals(m, "all") || mentionIdEquals(m, "_all"));
             if (isAllMention) {
+              if (messageId) leader.channel.addTypingIndicator(messageId).catch(() => {});
               await router.route(message, images, files, messageId, msgCtx);
               return;
             }
@@ -953,12 +959,14 @@ export class HttpServer {
 
             if (botOpenId && mentions?.some((m: any) => mentionIdEquals(m, botOpenId))) {
               // @了A自己：A直接处理
+              if (messageId) leader.channel.addTypingIndicator(messageId).catch(() => {});
               await leader.commands.processMessage(message, images, files, messageId, msgCtx);
             } else if (!hasAnyBotMention) {
               // 没@任何人：A作为默认bot处理
+              if (messageId) leader.channel.addTypingIndicator(messageId).catch(() => {});
               await leader.commands.processMessage(message, images, files, messageId, msgCtx);
             } else {
-              // @了其他bot或botOpenId未知：A忽略
+              // @了其他bot或botOpenId未知：A忽略（不亮表态）
               console.log("[AgentRouter] A通道忽略（@了其他bot或botOpenId未知）");
             }
           });

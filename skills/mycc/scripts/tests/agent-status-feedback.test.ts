@@ -40,6 +40,7 @@ function createStreamingChannelMock() {
         start: vi.fn(async () => {}),
         update: vi.fn(async (text: string) => { updates.push(text); }),
         close: vi.fn(async () => {}),
+        addToolCall: vi.fn(() => {}),
         isActive: () => true,
       }),
     },

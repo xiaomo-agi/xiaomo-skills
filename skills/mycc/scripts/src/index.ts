@@ -43,6 +43,27 @@ const PORT = process.env.PORT || 18080;
 const WORKER_URL = process.env.WORKER_URL || "https://api.mycc.dev";
 const PACKAGE_NAME = "mycc-backend";
 
+// 日志时间戳前缀（2026-10-26 P2-1）：所有 console 输出统一加 [HH:MM:SS]，
+// 此前 mycc.log 无任何时间信息，排查延迟/重复/回合时长只能靠行号猜。
+// 在入口处劫持一次全局生效，各模块的 console 调用点零改动；
+// 已带时间戳的行（理论不会有）防重复加前缀。
+{
+  const stamp = () => {
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]`;
+  };
+  const isStamped = (firstArg: unknown) =>
+    typeof firstArg === "string" && firstArg.startsWith("[") && /^\[\d{2}:\d{2}:\d{2}\]/.test(firstArg);
+  for (const method of ["log", "warn", "error"] as const) {
+    const original = console[method].bind(console);
+    console[method] = (...args: unknown[]) => {
+      if (args.length > 0 && !isStamped(args[0])) original(stamp(), ...args);
+      else original(...args);
+    };
+  }
+}
+
 
 // 检测版本更新
 async function checkVersionUpdate(): Promise<void> {

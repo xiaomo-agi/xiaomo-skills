@@ -86,6 +86,27 @@ describe("Scheduler 模块", () => {
       });
     });
 
+    it("应该解析每月任务（每月X号 HH:MM 格式）", () => {
+      const content = `
+## 每月任务
+
+| 时间 | 任务 | Skill | 说明 |
+|------|------|-------|------|
+| 每月1号 10:00 | 养老保险 | /tell-me | 主提醒 |
+| 每月5日 10:00 | 养老保险补 | /tell-me | 补提醒 |
+`;
+      const tasks = parseTasks(content);
+      expect(tasks).toHaveLength(2);
+      expect(tasks[0]).toEqual({
+        time: "每月1号 10:00",
+        name: "养老保险",
+        skill: "/tell-me",
+        desc: "主提醒",
+        type: "monthly",
+      });
+      expect(tasks[1].type).toBe("monthly");
+    });
+
     it("应该跳过无效时间格式", () => {
       const content = `
 | 时间 | 任务 | Skill | 说明 |
@@ -290,6 +311,51 @@ describe("Scheduler 模块", () => {
         // 任务时间是 2026-01-30，但现在是 2026-02-01
         const now = new Date("2026-02-01T10:00:00");
         expect(matchTime("2026-01-30 10:00", now)).toBe(false);
+      });
+    });
+
+    describe("每月任务", () => {
+      it("日期和时间都匹配时返回 true", () => {
+        // 2026-02-01 是 1 号
+        const now = new Date("2026-02-01T10:00:00");
+        expect(matchTime("每月1号 10:00", now)).toBe(true);
+      });
+
+      it("日期不匹配返回 false", () => {
+        const now = new Date("2026-02-02T10:00:00");
+        expect(matchTime("每月1号 10:00", now)).toBe(false);
+      });
+
+      it("时间不匹配返回 false", () => {
+        const now = new Date("2026-02-01T11:00:00");
+        expect(matchTime("每月1号 10:00", now)).toBe(false);
+      });
+
+      it("支持 '日' 后缀", () => {
+        const now = new Date("2026-02-05T10:00:00");
+        expect(matchTime("每月5日 10:00", now)).toBe(true);
+      });
+
+      it("每月任务也允许 ±2 分钟误差", () => {
+        const now = new Date("2026-02-01T10:02:00");
+        expect(matchTime("每月1号 10:00", now)).toBe(true);
+      });
+
+      it("跨月只在对应号数触发", () => {
+        expect(matchTime("每月1号 10:00", new Date("2026-03-01T10:00:00"))).toBe(true);
+        expect(matchTime("每月5号 10:00", new Date("2026-03-01T10:00:00"))).toBe(false);
+      });
+
+      it("号数大于当月最大天数时不触发（2 月配 30 号）", () => {
+        // 2026-02 只有 28 天，30 号永不到来
+        expect(matchTime("每月30号 10:00", new Date("2026-02-28T10:00:00"))).toBe(false);
+      });
+
+      it("无效格式返回 false", () => {
+        const now = new Date("2026-02-01T10:00:00");
+        expect(matchTime("每月1号", now)).toBe(false); // 缺时间
+        expect(matchTime("每月 10:00", now)).toBe(false); // 缺号数
+        expect(matchTime("每月号 10:00", now)).toBe(false); // 缺数字
       });
     });
 

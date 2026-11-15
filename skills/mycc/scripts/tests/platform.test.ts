@@ -55,7 +55,7 @@ describe("sleep - 跨平台延迟", () => {
 
 describe("getRoot - 根目录获取", () => {
   it("Mac/Linux 路径返回 /", () => {
-    expect(getRoot("/Users/aster/project")).toBe("/");
+    expect(getRoot("/Users/someone/project")).toBe("/");
     expect(getRoot("/home/user/work")).toBe("/");
     expect(getRoot("/")).toBe("/");
   });

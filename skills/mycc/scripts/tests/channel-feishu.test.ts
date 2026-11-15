@@ -12,6 +12,9 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+// 捕获 EventDispatcher 注册的事件回调，测试里可直接驱动 WS 事件（多图聚合回归用）
+const sdkEvents = vi.hoisted(() => ({ handles: {} as Record<string, (data: unknown) => Promise<void> | void> }));
+
 // mock 飞书 SDK（必须在 import FeishuChannel 之前）
 vi.mock("@larksuiteoapi/node-sdk", () => {
   return {
@@ -21,7 +24,7 @@ vi.mock("@larksuiteoapi/node-sdk", () => {
         close: vi.fn(),
       })),
       EventDispatcher: vi.fn().mockImplementation(() => ({
-        register: vi.fn(),
+        register: vi.fn((handles: Record<string, unknown>) => { Object.assign(sdkEvents.handles, handles); }),
       })),
       Domain: { Feishu: "feishu" },
       LoggerLevel: { info: "info" },
@@ -480,6 +483,9 @@ describe("FeishuChannel", () => {
       // 不应尝试创建 WSClient
       // 只调用了一次 fetch（获取 token 失败）
       expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      // 清掉自愈重试定时器，避免 30s 后的重试泄漏进后续用例
+      channel.stop();
     });
 
     it("stop 清理状态", () => {
@@ -493,6 +499,98 @@ describe("FeishuChannel", () => {
       const cb = vi.fn();
       channel.onMessage(cb);
       // 验证不报错即可（内部状态无法直接检查）
+    });
+  });
+
+  describe("启动自愈（start 失败自动重试，2026-10-12 断网事故回归）", () => {
+    beforeEach(async () => {
+      vi.useFakeTimers();
+      // 重装 SDK mock（clearAllMocks 会清掉此前的 mockImplementation）
+      const Lark = await import("@larksuiteoapi/node-sdk");
+      (Lark.default.WSClient as any).mockImplementation(() => ({
+        start: vi.fn(),
+        close: vi.fn(),
+      }));
+      (Lark.default.EventDispatcher as any).mockImplementation(() => ({
+        register: vi.fn(),
+      }));
+    });
+
+    afterEach(() => {
+      channel.stop();
+      vi.useRealTimers();
+    });
+
+    it("start 取凭证失败（断网）→ 30s 后自动重试，网络恢复后通道上线", async () => {
+      const Lark = await import("@larksuiteoapi/node-sdk");
+      channel = new FeishuChannel({
+        ...validConfig,
+        connectionMode: "websocket" as const,
+      });
+
+      // 第一次：网络断了，取 token 抛 fetch failed（同 2026-10-12 事故）
+      mockFetch.mockImplementationOnce(() =>
+        Promise.reject(new TypeError("fetch failed"))
+      );
+      await channel.start();
+
+      // 只有一次失败的 token 请求，没建 WSClient
+      const tokenCallsAfterFail = mockFetch.mock.calls.filter((c) =>
+        String(c[0]).includes("tenant_access_token")
+      );
+      expect(tokenCallsAfterFail).toHaveLength(1);
+      expect(Lark.default.WSClient).not.toHaveBeenCalled();
+
+      // 网络恢复：token + bot info 都成功
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url.includes("tenant_access_token")) {
+          return { json: async () => ({ code: 0, tenant_access_token: "healed-token", expire: 3600 }) };
+        }
+        return { json: async () => ({ code: 0, bot: { open_id: "ou_bot" } }) };
+      });
+
+      // 30s 重试窗口到期 → 重试成功，WSClient 建起来
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      const tokenCallsAfterHeal = mockFetch.mock.calls.filter((c) =>
+        String(c[0]).includes("tenant_access_token")
+      );
+      expect(tokenCallsAfterHeal).toHaveLength(2);
+      expect(Lark.default.WSClient).toHaveBeenCalled();
+    });
+
+    it("连续失败 → 退避间隔递增 30s→60s→120s", async () => {
+      channel = new FeishuChannel(validConfig);
+      mockFetch.mockImplementation(() =>
+        Promise.reject(new TypeError("fetch failed"))
+      );
+
+      await channel.start(); // t=0 失败，安排 30s 后重试
+
+      await vi.advanceTimersByTimeAsync(30_000); // t=30s：第 1 次重试（失败，下次 60s 后）
+      expect(mockFetch.mock.calls.length).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(30_000); // t=60s：还不到点，不应重试
+      expect(mockFetch.mock.calls.length).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(30_000); // t=90s：第 2 次重试
+      expect(mockFetch.mock.calls.length).toBe(3);
+
+      await vi.advanceTimersByTimeAsync(120_000); // t=210s：第 3 次重试（120s 间隔到期）
+      expect(mockFetch.mock.calls.length).toBe(4);
+    });
+
+    it("stop() 后不再重试", async () => {
+      channel = new FeishuChannel(validConfig);
+      mockFetch.mockImplementation(() =>
+        Promise.reject(new TypeError("fetch failed"))
+      );
+
+      await channel.start();
+      channel.stop();
+
+      await vi.advanceTimersByTimeAsync(600_000); // 前进 10 分钟
+      expect(mockFetch.mock.calls.length).toBe(1); // 只有最初那次失败
     });
   });
 
@@ -1097,10 +1195,12 @@ describe("FeishuChannel", () => {
       // 验证是 schema 2.0 markdown 卡片，表格内容保留在 markdown 中
       const card = JSON.parse(body.content);
       expect(card.schema).toBe("2.0");
-      const markdownElement = card.body.elements.find((e: any) => e.tag === "markdown");
-      expect(markdownElement).toBeDefined();
-      expect(markdownElement.content).toContain("DAU");
-      expect(markdownElement.content).toContain("留存");
+      // 2026-10-31 表格转换：markdown 表格升级为原生 table 组件（body 根级）
+      const tableElement = card.body.elements.find((e: any) => e.tag === "table");
+      expect(tableElement).toBeDefined();
+      expect(tableElement.rows.length).toBeGreaterThan(0);
+      expect(JSON.stringify(tableElement)).toContain("DAU");
+      expect(JSON.stringify(tableElement)).toContain("留存");
     });
 
     it("parseMarkdownTable 表格前后有文字 → schema 2.0 卡片包含完整内容", async () => {
@@ -1126,11 +1226,14 @@ describe("FeishuChannel", () => {
 
       const card = JSON.parse(body.content);
       expect(card.schema).toBe("2.0");
-      const markdownElement = card.body.elements.find((e: any) => e.tag === "markdown");
-      expect(markdownElement).toBeDefined();
+      // 2026-10-31 表格转换：markdown 表格升级为原生 table 组件（body 根级）
+      const tableElement = card.body.elements.find((e: any) => e.tag === "table");
+      expect(tableElement).toBeDefined();
+      expect(tableElement.rows.length).toBeGreaterThan(0);
       // 前置文字、表格内容、后置文字都在 markdown 中
-      expect(markdownElement.content).toContain("前置文字");
-      expect(markdownElement.content).toContain("后置文字");
+      const bodyText = JSON.stringify(card.body.elements);
+      expect(bodyText).toContain("前置文字");
+      expect(bodyText).toContain("后置文字");
     });
 
     it("parseMarkdownTable 多列复杂表格 → schema 2.0 卡片保留表格内容", async () => {
@@ -1153,12 +1256,218 @@ describe("FeishuChannel", () => {
 
       const card = JSON.parse(body.content);
       expect(card.schema).toBe("2.0");
-      const markdownElement = card.body.elements.find((e: any) => e.tag === "markdown");
-      expect(markdownElement).toBeDefined();
+      // 2026-10-31 表格转换：markdown 表格升级为原生 table 组件（body 根级）
+      const tableElement = card.body.elements.find((e: any) => e.tag === "table");
+      expect(tableElement).toBeDefined();
+      expect(tableElement.rows.length).toBeGreaterThan(0);
       // 验证表格内容保留
-      expect(markdownElement.content).toContain("登录");
-      expect(markdownElement.content).toContain("李四");
-      expect(markdownElement.content).toContain("待开始");
+      expect(JSON.stringify(tableElement.rows)).toContain("登录");
+      expect(JSON.stringify(tableElement.rows)).toContain("李四");
+      expect(JSON.stringify(tableElement.rows)).toContain("待开始");
+    });
+  });
+
+  describe("多图消息聚合（MEDIA_BUFFER_DELAY 回归）", () => {
+    // 复现 2026-10-09 丢图根因：飞书把一次多图拆成多条 image 事件，300ms 窗口
+    // 等不齐 → 每张图各自成批。修复后含图片/文件的缓冲走 2s 长窗口聚成一批。
+
+    const makeImageEvent = (n: number) => ({
+      sender: { sender_id: { open_id: "ou_sender" } },
+      message: {
+        message_id: `om_img_${n}`,
+        chat_id: "oc_agg_chat",
+        chat_type: "p2p",
+        message_type: "image",
+        content: JSON.stringify({ image_key: `img_key_${n}` }),
+      },
+    });
+
+    const makeTextEvent = (text: string) => ({
+      sender: { sender_id: { open_id: "ou_sender" } },
+      message: {
+        message_id: `om_text_${Math.random().toString(36).slice(2, 8)}`,
+        chat_id: "oc_agg_chat",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text }),
+      },
+    });
+
+    beforeEach(async () => {
+      vi.useFakeTimers();
+      // 外层 afterEach 的 vi.restoreAllMocks 会把 vi.mock 工厂里 EventDispatcher/WSClient
+      // 的 mockImplementation 一并清掉（此前跑过的用例越多丢得越干净），这里每用例重装
+      const Lark = await import("@larksuiteoapi/node-sdk");
+      vi.mocked(Lark.default.EventDispatcher).mockImplementation((() => ({
+        register: (h: Record<string, unknown>) => { Object.assign(sdkEvents.handles, h); },
+      })) as any);
+      vi.mocked(Lark.default.WSClient).mockImplementation((() => ({
+        start: vi.fn(),
+        close: vi.fn(),
+      })) as any);
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/auth/v3/tenant_access_token")) {
+          return { ok: true, json: async () => ({ code: 0, tenant_access_token: "t-token", expire: 3600 }) };
+        }
+        if (url.includes("/resources/")) {
+          return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
+        }
+        // typing 表态 / bot info 等其余 API：成功空响应即可（失败也会被静默 catch）
+        return { ok: true, json: async () => ({ code: 0, bot: { open_id: "ou_bot" } }) };
+      });
+      channel = new FeishuChannel({ ...validConfig, connectionMode: "websocket" as const });
+      await channel.start();
+    });
+
+    afterEach(() => {
+      channel.stop();
+      vi.useRealTimers();
+    });
+
+    it("多条图片事件间隔 800ms 到达 → 只 flush 一次，一批带全部图", async () => {
+      const received: Array<{ text: string; images?: Array<unknown> }> = [];
+      channel.onMessage((text, images) => { received.push({ text, images }); });
+      const handler = sdkEvents.handles["im.message.receive_v1"];
+      expect(handler).toBeDefined();
+
+      await handler!(makeImageEvent(1));
+      await vi.advanceTimersByTimeAsync(800);
+      await handler!(makeImageEvent(2));
+      await vi.advanceTimersByTimeAsync(800);
+      await handler!(makeImageEvent(3));
+
+      // 图1(t=0) 图2(t=800) 图3(t=1600)，每次到达都重置 2s 窗 → 此刻未 flush
+      expect(received).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(2000); // t=3600，图3 的窗口到期
+      expect(received).toHaveLength(1);
+      expect(received[0].images).toHaveLength(3);
+    });
+
+    it("单张图片也走长窗口：300ms 旧窗口时间点不 flush，2s 后一次带 1 图", async () => {
+      const received: Array<{ text: string; images?: Array<unknown> }> = [];
+      channel.onMessage((text, images) => { received.push({ text, images }); });
+      const handler = sdkEvents.handles["im.message.receive_v1"];
+
+      await handler!(makeImageEvent(1));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(received).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(1700);
+      expect(received).toHaveLength(1);
+      expect(received[0].images).toHaveLength(1);
+    });
+
+    it("图后跟文字：缓冲含图时文字到达仍保持长窗口，图+文字合并成一批", async () => {
+      const received: Array<{ text: string; images?: Array<unknown> }> = [];
+      channel.onMessage((text, images) => { received.push({ text, images }); });
+      const handler = sdkEvents.handles["im.message.receive_v1"];
+
+      await handler!(makeImageEvent(1));
+      await vi.advanceTimersByTimeAsync(1500);
+      await handler!(makeTextEvent("这两张是今天的情绪记录"));
+
+      await vi.advanceTimersByTimeAsync(300); // 文字到达后 300ms：buffer 含图，仍不 flush
+      expect(received).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(1700); // 长窗口到期
+      expect(received).toHaveLength(1);
+      expect(received[0].images).toHaveLength(1);
+      expect(received[0].text).toContain("情绪记录");
+    });
+
+    it("纯文字消息仍用 300ms 短窗口", async () => {
+      const received: Array<{ text: string; images?: Array<unknown> }> = [];
+      channel.onMessage((text, images) => { received.push({ text, images }); });
+      const handler = sdkEvents.handles["im.message.receive_v1"];
+
+      await handler!(makeTextEvent("你好"));
+      await vi.advanceTimersByTimeAsync(400);
+      expect(received).toHaveLength(1);
+      expect(received[0].text).toBe("你好");
+    });
+  });
+
+  describe("post 富文本消息解析（图文混排）", () => {
+    // 2026-10-09 前 post 直接 return null 整条丢弃；现在提取文字+下载全部 img 段
+
+    const makePostEvent = (post: unknown) => ({
+      sender: { sender_id: { open_id: "ou_sender" } },
+      message: {
+        message_id: "om_post_1",
+        chat_id: "oc_post_chat",
+        chat_type: "p2p",
+        message_type: "post",
+        content: JSON.stringify(post),
+      },
+    });
+
+    beforeEach(() => {
+      // 直调 parseFeishuMessage：预置 token 绕过 getAccessToken
+      channel = new FeishuChannel({ ...validConfig });
+      (channel as any).accessToken = "preset-token";
+      (channel as any).tokenExpireTime = Date.now() + 3600_000;
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/resources/")) {
+          return { ok: true, arrayBuffer: async () => new Uint8Array([9, 9, 9]).buffer };
+        }
+        return { ok: true, json: async () => ({ code: 0 }) };
+      });
+    });
+
+    it("图文混排：文字按段落拼接 + 所有 img 段并行下载", async () => {
+      const parsed = await (channel as any).parseFeishuMessage(makePostEvent({
+        title: "今天的记录",
+        content: [
+          [
+            { tag: "text", text: "识别这两张：" },
+            { tag: "img", image_key: "img_key_a" },
+          ],
+          [
+            { tag: "text", text: "链接 " },
+            { tag: "a", text: "参考", href: "https://example.com" },
+            { tag: "img", image_key: "img_key_b" },
+          ],
+        ],
+      }), "om_post_1");
+
+      expect(parsed.text).toBe("今天的记录\n识别这两张：\n链接 参考(https://example.com)");
+      expect(parsed.images).toHaveLength(2);
+      const resourceCalls = mockFetch.mock.calls.filter((c: any[]) => typeof c[0] === "string" && c[0].includes("/resources/"));
+      expect(resourceCalls).toHaveLength(2);
+      expect(resourceCalls[0][0]).toContain("img_key_a");
+      expect(resourceCalls[1][0]).toContain("img_key_b");
+    });
+
+    it("纯文字 post：无图片下载，只返回文字", async () => {
+      const parsed = await (channel as any).parseFeishuMessage(makePostEvent({
+        content: [[{ tag: "text", text: "只是说句话" }]],
+      }), "om_post_1");
+
+      expect(parsed.text).toBe("只是说句话");
+      expect(parsed.images).toBeUndefined();
+    });
+
+    it("media/文件段：跳过并在文字中标注数量", async () => {
+      const parsed = await (channel as any).parseFeishuMessage(makePostEvent({
+        content: [
+          [
+            { tag: "text", text: "带视频的" },
+            { tag: "media", file_key: "file_v1", name: "a.mp4" },
+          ],
+        ],
+      }), "om_post_1");
+
+      expect(parsed.text).toContain("带视频的");
+      expect(parsed.text).toContain("1 个媒体/文件段");
+      expect(parsed.images).toBeUndefined();
+    });
+
+    it("空 post / 异常结构：返回空文本不崩溃", async () => {
+      const parsed = await (channel as any).parseFeishuMessage(makePostEvent({ content: [] }), "om_post_1");
+      expect(parsed).toEqual({ text: "" });
+      const parsed2 = await (channel as any).parseFeishuMessage(makePostEvent(null), "om_post_1");
+      expect(parsed2).toEqual({ text: "" });
     });
   });
 });

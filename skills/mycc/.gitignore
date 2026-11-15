@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+*.local.bak
+*.local.backup
+current.json
+.env
+.env.*
+!.env.example
+scripts/src/data/
+.mycc-channels/
+sentinel/
+tmp/
+.DS_Store

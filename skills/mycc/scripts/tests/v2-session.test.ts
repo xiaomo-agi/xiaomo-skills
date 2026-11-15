@@ -902,13 +902,15 @@ describe("cwd 传递 — SDKSessionOptions.cwd 直传方案", () => {
 
   it("buildSessionOptions 把 cwd 直接放进 SDKSessionOptions", () => {
     const officialSource = readFileSync(join(SRC, "adapters", "official.ts"), "utf-8");
-    expect(officialSource).toMatch(/function buildSessionOptions\(model\?:\s*string,\s*cwd\?:\s*string\)/);
+    // 09-06 串卡修复：签名加了第三参数 approvalHandle（当时漏改本断言，09-07 补）
+    expect(officialSource).toMatch(/function buildSessionOptions\(model\?:\s*string,\s*cwd\?:\s*string,\s*approvalHandle\?:\s*ApprovalCardHandle\)/);
     expect(officialSource).toMatch(/\.\.\.\(cwd\s*&&\s*\{\s*cwd\s*\}\)/);
   });
 
   it("getOrCreateSession 把 cwd 传给 buildSessionOptions", () => {
     const officialSource = readFileSync(join(SRC, "adapters", "official.ts"), "utf-8");
-    expect(officialSource).toMatch(/buildSessionOptions\(model,\s*cwd\)/);
+    // 09-06 串卡修复：审批句柄作为第三个参数随 cwd 一起传入
+    expect(officialSource).toMatch(/buildSessionOptions\(model,\s*cwd,\s*params\.approvalHandle\)/);
   });
 
   it("SessionParams 应包含 cwd 可选字段", () => {
@@ -1009,62 +1011,38 @@ describe("并发 getOrCreateSession — 不同 cwd 不再竞态", () => {
   });
 });
 
-// ============ 10d. settingSources patch 验证 ============
+// ============ 10d. settingSources — Skills/CLAUDE.md 加载 ============
+// 历史：曾靠 patch-sdk.mjs 改写 sdk.mjs 里的 settingSources:[] 硬编码。SDK 0.2.141
+// 提供官方 settingSources 字段后补丁静默失配（本组旧测试因此长红，一直被当
+// "存量环境噪音"忽略——2026-07-06 审查 H2）。现改为 buildSessionOptions 显式
+// 传入官方字段，测试对准新方案：断言我们自己的 options 形状 + SDK 支持透传。
 
-describe("settingSources patch — 修复 Skills 加载", () => {
+describe("settingSources — Skills/CLAUDE.md 加载（官方字段直传）", () => {
   const SDK_MJS_PATH = join(ROOT, "node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs");
   const PATCH_SCRIPT_PATH = join(ROOT, "scripts/patch-sdk.mjs");
 
-  it("SDK v2 的 V9 构造函数硬编码了 settingSources:[] — 这是 Skills 不加载的根因", () => {
-    // 未 patch 前，原始 SDK 中有 settingSources:[]
-    // patch 后应变为 settingSources:X.settingSources??["user","project"]
-    // 这个测试验证 patch 已生效
+  it("buildSessionOptions 显式传 settingSources:['user','project']", async () => {
+    const { buildSessionOptions } = await import("../src/adapters/official.js");
+    const options = buildSessionOptions("claude-fable-5", "/tmp") as any;
+    expect(options.settingSources).toEqual(["user", "project"]);
+  });
+
+  it("当前 SDK 支持 settingSources 透传（官方字段，无需再 patch sdk.mjs）", () => {
     const sdkSource = readFileSync(SDK_MJS_PATH, "utf-8");
-
-    // patch 后不应再有硬编码的 settingSources:[]
-    // 注意：e6 构造函数中也可能有 settingSources，但 V9→e6 的那个必须有默认值
-    // 用更精确的模式匹配 V9 构造函数中的 settingSources
-    expect(sdkSource).toContain('settingSources:X.settingSources??["user","project"]');
+    // 形如 settingSources:$.settingSources??[]（$ 是压缩后的变量名，随版本变化）
+    expect(sdkSource).toMatch(/settingSources:[\w$]+\.settingSources\?\?/);
   });
 
-  it("patch 脚本应存在于 scripts/patch-sdk.mjs", () => {
-    const exists = (() => {
-      try {
-        readFileSync(PATCH_SCRIPT_PATH, "utf-8");
-        return true;
-      } catch {
-        return false;
-      }
-    })();
-    expect(exists).toBe(true);
-  });
-
-  it("patch 脚本应替换 settingSources:[] 为带默认值的版本", () => {
+  it("patch-sdk.mjs 不再改写 sdk.mjs（只保留 cli.js 的 lP 补丁）", () => {
     const patchSource = readFileSync(PATCH_SCRIPT_PATH, "utf-8");
-    // patch 脚本中应包含替换逻辑
-    expect(patchSource).toContain("settingSources");
-    expect(patchSource).toMatch(/replace|patch/i);
+    expect(patchSource).not.toContain("SETTINGS_ORIGINAL");
+    expect(patchSource).toContain("lP");
   });
 
-  it("package.json 应有 postinstall 脚本执行 patch", () => {
+  it("package.json 保留 postinstall 执行 patch（cli.js 补丁仍需要）", () => {
     const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
     expect(pkg.scripts).toHaveProperty("postinstall");
     expect(pkg.scripts.postinstall).toContain("patch-sdk");
-  });
-
-  it("patch 后 SDK 仍可正常导入（不破坏语法）", async () => {
-    // 验证 patch 没有破坏 SDK 的 JS 语法
-    // 通过尝试导入来验证
-    const sdkSource = readFileSync(SDK_MJS_PATH, "utf-8");
-    // 基本语法检查：settingSources 后面应跟有效的 JS 表达式
-    expect(sdkSource).toMatch(/settingSources:X\.settingSources\?\?\[.*?\]/);
-  });
-
-  it("settingSources 包含 'user' 和 'project'，确保 CLAUDE.md 和 Skills 可加载", () => {
-    const sdkSource = readFileSync(SDK_MJS_PATH, "utf-8");
-    // 默认值应包含 "user" 和 "project"
-    expect(sdkSource).toContain('"user"');
-    expect(sdkSource).toContain('"project"');
   });
 });
 

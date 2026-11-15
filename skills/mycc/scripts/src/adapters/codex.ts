@@ -549,6 +549,14 @@ export class CodexAdapter implements CCAdapter {
     return true;
   }
 
+  /**
+   * 补充信息注入：codex 走一次性子进程模型（无长活 session 对象），
+   * 不支持 mid-turn 注入，恒返回 false——调用方降级排队（行为正确，仅缺能力）。
+   */
+  async steerSession(_sessionId: string, _text: string): Promise<boolean> {
+    return false;
+  }
+
   closeSession(sessionId: string): void {
     const children = this.activeChildren.get(sessionId);
     if (children) {

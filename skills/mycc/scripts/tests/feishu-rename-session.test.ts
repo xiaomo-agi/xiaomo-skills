@@ -27,6 +27,21 @@ import { encodeProjectPath, getConversation } from "../src/history.js";
 
 const DATA_DIR = process.env.MYCC_DATA_DIR || path.resolve(import.meta.dirname, "../src/data");
 
+function cardButtons(card: Record<string, unknown>): any[] {
+  const out: any[] = [];
+  const strip = (s: string) => String(s).replace(/<[^>]+>/g, "").replace(/\*\*/g, "");
+  const walk = (els: any[]) =>
+    els.forEach((e: any) => {
+      if (e.tag === "interactive_container" && Array.isArray(e.behaviors)) {
+        out.push({ text: { content: strip(e.elements?.[0]?.content ?? "") }, value: e.behaviors[0].value });
+      }
+      if (Array.isArray(e.elements)) walk(e.elements);
+      if (Array.isArray(e.columns)) e.columns.forEach((c: any) => walk(c.elements ?? []));
+    });
+  walk(card.body?.elements ?? card.elements ?? []);
+  return out;
+}
+
 function cleanPersistedState() {
   for (const f of ["channel-sessions.json", "channel-models.json", "channel-agents.json"]) {
     try { fs.rmSync(path.join(DATA_DIR, f)); } catch { /* absent */ }
@@ -62,9 +77,7 @@ describe("renameInputCard / 白名单", () => {
 
   it("helpMenuCard 会话组包含 /rename 按钮", () => {
     const card = helpMenuCard() as any;
-    const buttons = (card.elements as any[])
-      .filter((e) => e.tag === "action")
-      .flatMap((e) => e.actions);
+    const buttons = cardButtons(card);
     expect(buttons.some((b: any) => b.value.cmd === "/rename")).toBe(true);
   });
 });

@@ -11,6 +11,54 @@
  * 两种格式在 interactive 消息里可以并存。
  */
 
+import { MATCHA_CONFIG_STYLE, matchaHeaderBar } from "./card-style.js";
+
+// ==================== 2.0 容器按钮（形态5，2026-10-31 owner 定） ====================
+// 官方 button 锁 9 色；容器挂 behaviors callback = 可点 + 颜色自由。
+// value 与 1.0 按钮同构（{cmd}/{cb}/{__approval}），点击走同一个 card.action.trigger 处理器。
+
+type BtnVariant = "solid" | "outline" | "danger";
+
+function containerButton(
+  text: string,
+  value: Record<string, unknown> | CardCommandValue,
+  variant: BtnVariant = "outline"
+): Record<string, unknown> {
+  const shape =
+    variant === "solid"
+      ? { background_style: "matcha", corner_radius: "6px" }
+      : variant === "danger"
+        ? { has_border: true, border_color: "grey-200", corner_radius: "6px", background_style: "bg-white" }
+        : { has_border: true, border_color: "matcha-line", corner_radius: "6px", background_style: "matcha-bg" };
+  const content =
+    variant === "solid"
+      ? `<font color='white'>**${escapeMd(text)}**</font>`
+      : variant === "danger"
+        ? `**<font color='red'>${escapeMd(text)}</font>**`
+        : `**<font color='matcha-deep'>${escapeMd(text)}</font>**`;
+  return {
+    tag: "interactive_container",
+    width: "fill",
+    ...shape,
+    padding: "8px",
+    behaviors: [{ type: "callback", value: value as Record<string, unknown> }],
+    elements: [{ tag: "markdown", content, text_align: "center" }],
+  };
+}
+
+/** 2.0 按钮卡壳：抹茶抬头条 + 色板 + 边距（替代 1.0 cardShell 用于按钮卡） */
+function cardShell2(title: string, elements: Record<string, unknown>[]): Record<string, unknown> {
+  return {
+    schema: "2.0",
+    config: { update_multi: true, wide_screen_mode: true, ...MATCHA_CONFIG_STYLE },
+    body: {
+      direction: "vertical",
+      padding: "0px 0px 8px 0px",
+      elements: [matchaHeaderBar(title), ...elements.map((e) => ({ ...e, margin: e.margin ?? "0px 12px 8px 12px" }))],
+    },
+  };
+}
+
 /** 按钮点击回传的载荷：cmd 必须在白名单内，arg 是命令参数 */
 export interface CardCommandValue {
   cmd: string;
@@ -85,10 +133,17 @@ function actionsRow(buttons: ButtonSpec[]): Record<string, unknown> {
 
 const HR: Record<string, unknown> = { tag: "hr" };
 
-function cardShell(title: string, elements: Record<string, unknown>[]): Record<string, unknown> {
+function cardShell(
+  title: string,
+  elements: Record<string, unknown>[],
+  template?: string
+): Record<string, unknown> {
   return {
     config: { wide_screen_mode: true, update_multi: true },
-    header: { title: { tag: "plain_text", content: title } },
+    header: {
+      title: { tag: "plain_text", content: title },
+      ...(template ? { template } : {}),
+    },
     elements,
   };
 }
@@ -102,15 +157,10 @@ export function modelPickerCard(currentModel: string | null): Record<string, unk
     { label: "Sonnet", arg: "sonnet" },
     { label: "Haiku", arg: "haiku" },
   ];
-  return cardShell("🧠 切换模型", [
+  return cardShell2("🧠 切换模型", [
     divMd(`当前模型: \`${current}\`\n\n点击按钮切换（下一条消息起生效），也可以发 \`/model <完整模型 ID>\``),
-    HR,
-    actionsRow(
-      models.map((m) => ({
-        text: m.label,
-        value: { cmd: "/model", arg: m.arg },
-        style: "primary" as const,
-      }))
+    ...models.map((m, i) =>
+      containerButton(m.label, { cmd: "/model", arg: m.arg }, i === 0 ? "solid" : "outline")
     ),
   ]);
 }
@@ -134,9 +184,9 @@ export function agentPickerCard(
     divMd(`当前 agent: \`${current}\`（只作用于当前群/话题）\n\n${lines}`),
   ];
   if (buttons.length > 0) {
-    elements.push(HR, actionsRow(buttons));
+    for (const b of buttons) elements.push(containerButton(b.text, b.value));
   }
-  return cardShell("🤖 切换 Agent 供应商", elements);
+  return cardShell2("🤖 切换 Agent 供应商", elements);
 }
 
 export interface SessionEntry {
@@ -156,18 +206,14 @@ export function sessionPickerCard(entries: SessionEntry[], total: number): Recor
   entries.forEach((e, i) => {
     const marker = e.current ? "  ← 当前" : "";
     elements.push(divMd(`**${e.index}. ${escapeMd(e.title)}**${marker}\n${e.timeAgo}`));
-    elements.push(
-      actionsRow([
-        {
-          text: e.current ? "已是当前会话" : "▸ 切换到此会话",
-          value: { cmd: "/switch", arg: String(e.index) },
-          style: e.current ? "default" : "primary",
-        },
-      ])
-    );
+    if (!e.current) {
+      elements.push(
+        containerButton("▸ 切换到此会话", { cmd: "/switch", arg: String(e.index) })
+      );
+    }
     if (i < entries.length - 1) elements.push(HR);
   });
-  return cardShell("🗂 历史会话", elements);
+  return cardShell2("🗂 历史会话", elements);
 }
 
 /**
@@ -175,13 +221,10 @@ export function sessionPickerCard(entries: SessionEntry[], total: number): Recor
  * 正在干活时点击也能立即响应。text 由调用方拼好（含 describeProgress 的耗时/工具片段）。
  */
 export function processingNoticeCard(text: string): Record<string, unknown> {
-  return cardShell("⏳ 正在处理", [
+  return cardShell2("⏳ 正在处理", [
     divMd(text),
-    HR,
-    actionsRow([
-      { text: "🛑 终止当前任务", value: { cmd: "/stop" }, style: "danger" },
-      { text: "查看进度", value: { cmd: "/status" }, style: "default" },
-    ]),
+    containerButton("🛑 终止当前任务", { cmd: "/stop" }, "danger"),
+    containerButton("查看进度", { cmd: "/status" }),
   ]);
 }
 
@@ -190,18 +233,15 @@ export function processingNoticeCard(text: string): Record<string, unknown> {
  * 只出"切到另一侧"的按钮，避免点当前状态产生无意义的往返。
  */
 export function streamToggleCard(current: boolean): Record<string, unknown> {
-  return cardShell("📡 流式输出", [
+  return cardShell2("📡 流式输出", [
     divMd(
       `当前状态: **${current ? "开启" : "关闭"}**（只作用于当前群/话题，重启后仍生效）\n\n` +
         "开启：回复边生成边更新到卡片，能看到工具调用过程\n" +
         "关闭：处理期间保持安静，完成后一次性发送完整回复"
     ),
-    HR,
-    actionsRow([
-      current
-        ? { text: "🔕 关闭流式输出", value: { cmd: "/stream", arg: "off" }, style: "primary" as const }
-        : { text: "📡 开启流式输出", value: { cmd: "/stream", arg: "on" }, style: "primary" as const },
-    ]),
+    current
+      ? containerButton("🔕 关闭流式输出", { cmd: "/stream", arg: "off" })
+      : containerButton("📡 开启流式输出", { cmd: "/stream", arg: "on" }),
   ]);
 }
 
@@ -214,13 +254,10 @@ export function confirmActionCard(
   confirmText: string,
   confirmValue: CardCommandValue
 ): Record<string, unknown> {
-  return cardShell("⚠️ 请确认", [
+  return cardShell2("⚠️ 请确认", [
     divMd(question),
-    HR,
-    actionsRow([
-      { text: confirmText, value: confirmValue, style: "danger" },
-      { text: "取消", value: { cmd: "/noop" }, style: "default" },
-    ]),
+    containerButton(confirmText, confirmValue, "danger"),
+    containerButton("取消", { cmd: "/noop" }),
   ]);
 }
 
@@ -237,22 +274,49 @@ export function optionPickerCard(
   question: string,
   options: Array<{ label: string; token: string }>
 ): Record<string, unknown> {
-  const specs: ButtonSpec[] = options.map((o, i) => ({
-    text: o.label.length > OPTION_LABEL_MAX ? `${o.label.slice(0, OPTION_LABEL_MAX - 1)}…` : o.label,
-    value: { cb: o.token },
-    style: i === 0 ? ("primary" as const) : ("default" as const),
-  }));
-  const oneRow = specs.every((s) => s.text.length <= 10);
-  const elements: Record<string, unknown>[] = [
-    divMd(`${escapeMd(question)}\n\n点击按钮回答，也可以直接打字回复`),
-    HR,
-  ];
-  if (oneRow) {
-    elements.push(actionsRow(specs));
-  } else {
-    for (const s of specs) elements.push(actionsRow([s]));
-  }
-  return cardShell("🔘 请选择", elements);
+  // 2026-10-31 形态5（owner 定）：容器按钮——2.0 interactive_container 挂 behaviors 回调，
+  // 颜色自由（官方 button 锁 9 色）。value={cb:token} 与 1.0 同构，点击仍走
+  // card.action.trigger → cardActionCallback，验票路径不变
+  const letters = "ABCDEF";
+  const optionBlocks = options.map((o, i) => {
+    const letter = letters[i] ?? String(i + 1);
+    const label =
+      o.label.length > OPTION_LABEL_MAX
+        ? `${o.label.slice(0, OPTION_LABEL_MAX - 1)}…`
+        : o.label;
+    return {
+      tag: "interactive_container",
+      width: "fill",
+      has_border: true,
+      border_color: "matcha-line",
+      corner_radius: "6px",
+      background_style: "matcha-bg",
+      padding: "8px 12px",
+      margin: "0px 0px 8px 0px",
+      behaviors: [{ type: "callback", value: { cb: o.token } }],
+      elements: [
+        {
+          tag: "markdown",
+          content: `**<font color='matcha-deep'>${letter} · ${escapeMd(label)}</font>**`,
+          text_align: "center",
+        },
+      ],
+    };
+  });
+  return {
+    schema: "2.0",
+    config: { update_multi: true, wide_screen_mode: true, ...MATCHA_CONFIG_STYLE },
+    header: { title: { tag: "plain_text", content: "🔘 请选择" }, template: "green" },
+    body: {
+      direction: "vertical",
+      padding: "0px 0px 8px 0px",
+      elements: [
+        { tag: "markdown", content: `**${escapeMd(question)}**\n\n点击选项回答，也可以直接打字回复`, margin: "0px 12px 10px 12px" },
+        ...optionBlocks.map((b) => ({ ...b, margin: "0px 12px 8px 12px" })),
+        { tag: "markdown", content: "<font color='grey'>点选项即回答，也可以直接打字回复</font>", text_size: "notation", margin: "0px 12px 0px 12px" },
+      ],
+    },
+  };
 }
 
 function escapeMd(s: string): string {
@@ -312,16 +376,10 @@ export function renameInputCard(currentTitle?: string): Record<string, unknown> 
 export function helpMenuCard(): Record<string, unknown> {
   const group = (title: string, cmds: Array<{ cmd: string; label: string }>) => [
     divMd(`**${title}**`),
-    actionsRow(
-      cmds.map((c) => ({
-        text: `${c.cmd} ${c.label}`,
-        value: { cmd: c.cmd },
-      }))
-    ),
+    ...cmds.map((c) => containerButton(`${c.cmd} ${c.label}`, { cmd: c.cmd })),
   ];
-  return cardShell("📖 命令菜单", [
+  return cardShell2("📖 命令菜单", [
     divMd("点按钮 = 直接执行对应命令。每个私聊/群/话题是独立会话。"),
-    HR,
     ...group("会话（作用于当前群/话题）", [
       { cmd: "/new", label: "新会话" },
       { cmd: "/sessions", label: "历史会话" },
@@ -333,6 +391,7 @@ export function helpMenuCard(): Record<string, unknown> {
     ...group("模型 / Agent / 输出（点开再选）", [
       { cmd: "/model", label: "切换模型" },
       { cmd: "/agent", label: "切换供应商" },
+      { cmd: "/ask", label: "旁路问进度" },
       { cmd: "/stream", label: "流式开关" },
     ]),
     ...group("信息查询", [
@@ -345,7 +404,6 @@ export function helpMenuCard(): Record<string, unknown> {
       { cmd: "/usage", label: "Token 用量" },
       { cmd: "/compact", label: "压缩历史" },
     ]),
-    HR,
     divMd(
       "需要参数的命令直接打字：\n" +
         "`/switch <序号>` 切历史会话 · `/new <标题>` 带标题建会话 · `/rename <新标题>` 重命名当前会话\n" +
@@ -408,14 +466,10 @@ export function detectSuggestedCommands(text: string): string[] | null {
 
 /** 回复尾部追发的快捷命令卡片：按钮 value 走命令白名单主路径，点击=手敲 */
 export function commandSuggestionCard(cmds: string[]): Record<string, unknown> {
-  return cardShell("⚡ 快捷命令", [
+  return cardShell2("⚡ 快捷命令", [
     divMd("上面提到了这些命令，点按钮直接执行："),
-    actionsRow(
-      cmds.map((cmd, i) => ({
-        text: cmd,
-        value: { cmd },
-        style: i === 0 ? ("primary" as const) : ("default" as const),
-      }))
+    ...cmds.map((cmd, i) =>
+      containerButton(cmd, { cmd }, i === 0 ? "solid" : "outline")
     ),
   ]);
 }

@@ -2,6 +2,8 @@
  * 公共类型定义
  */
 
+import type { ApprovalCardHandle } from "./permissions/approval.js";
+
 // ============ 设备与配置 ============
 
 /** 设备配置（持久化到 current.json） */
@@ -42,6 +44,8 @@ export interface ChatParams {
   images?: ImageData[];
   model?: string;
   settingSources?: string[];
+  /** 本会话的飞书审批句柄：随消息带入 adapter，会话创建时闭包进 canUseTool（09-06 串卡修复） */
+  approvalHandle?: ApprovalCardHandle;
 }
 
 

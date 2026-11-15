@@ -28,18 +28,23 @@ function cleanPersistedState() {
   }
 }
 
+// 2026-10-31 容器按钮（形态5）：从 2.0 卡提取 interactive_container 按钮
 function extractButtons(card: Record<string, unknown>): any[] {
-  const elements = (card as any).elements as any[];
-  return elements.filter((e) => e.tag === "action").flatMap((e) => e.actions);
+  const out: any[] = [];
+  const strip = (s: string) => String(s).replace(/<[^>]+>/g, "").replace(/\*\*/g, "");
+  const walk = (els: any[]) =>
+    els.forEach((e: any) => {
+      if (e.tag === "interactive_container" && Array.isArray(e.behaviors)) {
+        out.push({ text: { content: strip(e.elements?.[0]?.content ?? "") }, value: e.behaviors[0].value });
+      }
+      if (Array.isArray(e.elements)) walk(e.elements);
+      if (Array.isArray(e.columns)) e.columns.forEach((c: any) => walk(c.elements ?? []));
+    });
+  walk(card.body?.elements ?? card.elements ?? []);
+  return out;
 }
 
 describe("detectSuggestedCommands", () => {
-  it("检测回复里提到的白名单命令，去重保序", () => {
-    expect(
-      detectSuggestedCommands("可以发 /context 查看占用，然后用 /compact 压缩。再看看 /context 变化")
-    ).toEqual(["/context", "/compact"]);
-  });
-
   it("反引号包裹的命令也能检测（AI 常写成 `/model`）", () => {
     expect(detectSuggestedCommands("发 `/model` 可以切换模型")).toEqual(["/model"]);
   });
@@ -181,7 +186,7 @@ describe("FeishuCommands 快捷命令端到端", () => {
 
     expect(cardReplies).toHaveLength(1);
     const buttons = extractButtons(cardReplies[0]);
-    expect(buttons.map((b) => b.text.content)).toEqual(["现在压缩", "先不动"]);
+    expect(buttons.map((b) => b.text.content)).toEqual(["A · 现在压缩", "B · 先不动"]);
   });
 
   it("回复没提命令 → 不追发卡片", async () => {

@@ -36,7 +36,7 @@ function stripSystemTags(text: string): string {
 
 /**
  * 将项目路径编码为 Claude 使用的目录名
- * /Users/aster/AIproject/mylife → -Users-aster-AIproject-mylife
+ * /Users/someone/AIproject/mylife → -Users-someone-AIproject-mylife
  *
  * 自动检测项目根目录（查找 .claude/ 或 CLAUDE.md），确保历史记录路径一致性
  */
