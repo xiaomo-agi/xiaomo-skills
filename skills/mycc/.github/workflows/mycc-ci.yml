@@ -39,3 +39,4 @@ jobs:
       - name: 全量测试（信息性：网络/时序用例在 CI 环境预期部分失败）
         run: npx vitest run --reporter=dot
         continue-on-error: true
+        timeout-minutes: 8  # Windows 上个别用例会挂住，封顶防止 run 无限拖
