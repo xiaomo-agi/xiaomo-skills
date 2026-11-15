@@ -124,6 +124,13 @@ async function main() {
       await serviceCommand(args[1], args.slice(2));
       exitCli();
       break;
+    case "doctor": {
+      const { runDoctor, renderDoctor } = await import("./doctor.js");
+      const results = await runDoctor();
+      console.log(renderDoctor(results).text);
+      exitCli();
+      break;
+    }
     case "help":
     default:
       showHelp();
@@ -814,6 +821,7 @@ ${chalk.yellow("用法:")}
   mycc ps               列出注册的后端进程
   mycc kill <id|pid|序号>  干掉指定进程（先用 ps 查看）
   mycc service <子命令>  OS 托管服务（开机自启+崩溃自动重启，mycc service help 看详情）
+  mycc doctor           新机器自查（Node/Claude Code/trash/凭证/端口一键体检）
   mycc help             显示帮助
 
 ${chalk.yellow("选项:")}

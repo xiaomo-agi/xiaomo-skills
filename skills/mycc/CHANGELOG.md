@@ -13,6 +13,8 @@
 - **富媒体**：post 富文本图文混排整条解析（丢图修复）、多图聚合缓冲、文件收发
 - **多通道**：`FEISHU{suffix}_*` 环境变量驱动多飞书应用通道（A/B/C/…），会话/模型/配对互相独立
 - **可观测**：日志统一 HH:MM:SS 时间戳、/events SSE、health 接口、session 统计
+- **doctor 自查子命令**：`mycc doctor` 一键体检新机器（Node 版本/Claude Code 可执行/trash 命令/飞书凭证有无/patch-sdk/端口占用），凭证只报有无不回显
+- **CI 跨平台横测**：GitHub Actions 矩阵（Linux/Windows × Node 18/20）——tsc 门 + 平台无关核心测试门 + 全量信息跑（待多平台首跑回归）
 
 ## v1.0.0 — 2026-07-02
 
