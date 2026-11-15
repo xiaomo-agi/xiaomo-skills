@@ -79,7 +79,7 @@ npm run build      # tsc 编译
 |---|---|
 | 主开发/长驻验证 | macOS 26 (Apple Silicon) · Claude Code 官方版 · @anthropic-ai/claude-agent-sdk 0.2.63 · 2026-11 |
 | 模型档位 | Claude（主）+ CC Switch 切换的国产模型（GLM / MiniMax，经 CC 接入）· 2026-11 |
-| 测试规模 | vitest 1070 用例（1049+ 过，少量网络/时序用例无网环境预期失败） |
+| 测试规模 | vitest 1086 用例（含 doctor 16 项；1049+ 过，少量网络/时序用例无网环境预期失败） |
 | CI 自动横测 | GitHub Actions：Linux/Windows × Node 18/20 矩阵（tsc 门 + 核心测试门 + 全量信息跑）——已配置，待多平台首跑回归 |
 | doctor 自查 | `npx tsx src/index.ts doctor`：Node/Claude Code/trash/凭证/patch-sdk/端口一键体检——已加入，待多环境实测反馈 |
 | 待真机验证 | Linux（systemd）/ Windows（schtasks）守护路径、非 Apple Silicon 环境 |
