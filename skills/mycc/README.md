@@ -42,6 +42,14 @@ npx tsx src/index.ts kill <id|pid>  # 干掉指定进程
 
 作为 Claude Code Skill 安装：把本仓库放入 `.claude/skills/mycc`（参考 [SKILL.md](SKILL.md)），即可对 Claude Code 说「启动 mycc」。
 
+## 截图预览
+
+| 流式回复 + 工具调用折叠 | 意图级审批卡 | 原生表格卡 |
+|---|---|---|
+| ![流式回复+工具调用折叠](docs/images/streaming-folding.jpg) | ![审批卡](docs/images/approval-card.jpg) | ![表格卡](docs/images/context-table.jpg) |
+
+*飞书手机端实拍；敏感信息已打码。*
+
 ## 飞书应用配置
 
 1. [飞书开放平台](https://open.feishu.cn) 创建企业自建应用，拿到 App ID / App Secret
