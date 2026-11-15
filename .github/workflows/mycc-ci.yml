@@ -1,0 +1,41 @@
+# mycc CI — 跨平台自动横测
+# 矩阵：OS（Linux/Windows）× Node（18/20），对应 README「测试环境记录」里没有真机的格子。
+# 门禁 = tsc 类型检查 + 平台无关核心测试；全量测试为信息性（网络/时序用例在 CI 预期部分失败）。
+
+name: mycc CI
+
+on:
+  push:
+    paths: ["skills/mycc/**", ".github/workflows/mycc-ci.yml"]
+  pull_request:
+    paths: ["skills/mycc/**", ".github/workflows/mycc-ci.yml"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · node${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: skills/mycc/scripts
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [18, 20]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: skills/mycc/scripts/package-lock.json
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+      - name: 类型检查（硬门）
+        run: npx tsc --noEmit
+      - name: 核心测试（硬门：纯逻辑，平台无关）
+        run: npx vitest run tests/permissions-gate.test.ts tests/doctor.test.ts tests/card-style.test.ts
+      - name: 全量测试（信息性：网络/时序用例在 CI 环境预期部分失败）
+        run: npx vitest run --reporter=dot
+        continue-on-error: true
