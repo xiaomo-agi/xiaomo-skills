@@ -6,3 +6,5 @@ Thumbs.db
 dist/
 current.json
 
+__pycache__/
+*.pyc

@@ -69,6 +69,7 @@
 |---|---|---|---|
 | [sentinel](./skills/sentinel/) | 飞书妙记哨兵。自动扫描新录音，提取待办/素材/金句 | 自动运行 / `sentinel` | lark-cli + 飞书应用 |
 | [sentinel-minimal](./skills/sentinel-minimal/) | 哨兵轻量版。零依赖，只扫描存档不通知 | `sentinel-minimal` | lark-cli |
+| [sentinel-hermes](./skills/sentinel-hermes/) | 哨兵 Hermes 版。给常驻 Agent 定时值守：扫描+归档全文+提炼，静默零打扰，56 条实战坑位 + 机器校验 | 自动运行 / `sentinel-hermes` | lark-cli + Hermes Agent |
 | [mycc](./skills/mycc/) | 飞书机器人远程操控 CC，支持多会话/文件收发 | `/mycc` | Node.js 18+ + 飞书应用 |
 
 ### 🧠 涛哥认知 OS（一套 8 个）
@@ -157,6 +158,20 @@ sentinel 的精简版本：
 
 适合：不想折腾飞书应用、只需要本地存档的用户。
 
+### sentinel-hermes — Hermes Agent 定时值守版
+
+给**有常驻 Agent（Hermes）**的用户：让 Agent 在后台定时值守妙记，只做「扫描 + 归档」一件事：
+
+- ✅ **静默零打扰**：不发通知、不建任务卡，所有产出落本地归档目录
+- ✅ **完整实战 SOP**：搜索分页陷阱 / 三道去重 / 逐字稿多路降级 / 撞名防覆盖，全部踩坑记录在 rules.md
+- ✅ **零 token 闸门**：无新稿时 cron 闸门输出字节不变，Agent 不被唤醒，定时值守零成本
+- ✅ **机器校验 fact_check**：归档前强制校验，提炼里出现转写原文没有的断言 = P0 不过
+- ✅ **只读飞书**：只需 `minutes:minutes:readonly` 等只读权限，逐字稿不出本机
+
+适合：想让 AI 日报式值守录音库、在意隐私（不外发任何数据）、要完整归档（全文+提炼）的用户。
+
+> 三个版本怎么选：要飞书通知选 [sentinel](#sentinel--飞书妙记自动整理)；零依赖手动选 [sentinel-minimal](#sentinel-minimal--零依赖轻量版)；有 Hermes Agent 要全自动静默值守选 sentinel-hermes。
+
 ### mycc — 飞书远程操控后端
 
 在飞书里发消息，远程操控你电脑上的 Claude Code：
@@ -209,6 +224,13 @@ xiaomo-skills/
     │   ├── rules.md
     │   ├── prompts.md
     │   └── SETUP.md
+    ├── sentinel-hermes/               # 哨兵 Hermes 版（Agent 定时值守，静默归档）
+    │   ├── SKILL.md                   # 主入口（三版本对比表）
+    │   ├── rules.md                   # 56 条实战坑位
+    │   ├── prompts.md                 # 执行流程模板
+    │   ├── SETUP.md                   # 安装配置指南
+    │   ├── references/                # 批次统一整理方法论
+    │   └── scripts/                   # 5 个脚本（扫描/闸门/复查/欠账/校验）
     ├── mycc/                          # 飞书远程操控后端
     │   ├── SKILL.md
     │   └── scripts/                   # 服务端代码
