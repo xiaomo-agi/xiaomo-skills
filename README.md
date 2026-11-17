@@ -248,6 +248,18 @@ xiaomo-skills/
 
 ---
 
+## 姊妹项目 · DayInk
+
+**把待办清单变成手机壁纸。** 写下今天要做的事，一键生成像素风壁纸，同步设为锁屏和主屏——每次亮屏都看见自己要做什么。
+
+- 今日待办每天最多 10 条，完成一条划掉一条；储备池存「暂时不想做又不想忘」的事
+- 目标管理 / 重复任务 / 日历视图 / JSON 全量备份，完全本地存储，无账号无云端
+- Android 8.0+，[Releases 直接下 APK](https://github.com/xiaomo-agi/DayInk/releases)
+
+👉 **[github.com/xiaomo-agi/DayInk](https://github.com/xiaomo-agi/DayInk)**（非商业免费协议）
+
+---
+
 ## 鸣谢
 
 - **[situk-yangtao-perspective](https://github.com/situker/situk-yangtao-perspective)** by 司徒K — README 排版参考
