@@ -3,7 +3,7 @@
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 ![Version](https://img.shields.io/badge/version-v1.1-green?style=flat-square)
 ![Claude-Skill](https://img.shields.io/badge/Claude-Skill-purple?style=flat-square)
-![Skills](https://img.shields.io/badge/Skills-11-orange?style=flat-square)
+![Skills](https://img.shields.io/badge/Skills-12-orange?style=flat-square)
 
 > 小mo 的 Claude Skills 开源库。让 AI 帮你整理纪要、提取待办、分析内容、远程操控 Claude Code —— 一句话的事。
 
@@ -71,6 +71,7 @@
 | [sentinel-minimal](./skills/sentinel-minimal/) | 哨兵轻量版。零依赖，只扫描存档不通知 | `sentinel-minimal` | lark-cli |
 | [sentinel-hermes](./skills/sentinel-hermes/) | 哨兵 Hermes 版。给常驻 Agent 定时值守：扫描+归档全文+提炼，静默零打扰，56 条实战坑位 + 机器校验 | 自动运行 / `sentinel-hermes` | lark-cli + Hermes Agent |
 | [mycc](./skills/mycc/) | 飞书机器人远程操控 CC，支持多会话/文件收发 | `/mycc` | Node.js 18+ + 飞书应用 |
+| [book-tutor](./skills/book-tutor/) | 读书陪读 AI 版。AI 拿书稿逐章精读，答疑先反问、出题分层、掌握度验收 | 「陪我读 X」「考考我这本书」 | 无（能读文件+能对话即可） |
 
 ### 🧠 涛哥认知 OS（一套 8 个）
 
@@ -205,6 +206,21 @@ sentinel 的精简版本：
 
 **关于涛哥**：二十年连续创业者，公众号《屋里涛说》、知识星球《平民创业手册》、《确定性成长》作者。微信：**tata4a**，备注"小mo推荐"，领取全套《平民创业手册》。
 
+### book-tutor — 读书陪读 AI 版
+
+把「读完一本书」变成「读完 → 输出 → 用出去 → 固化成清单」的完整陪读流程。AI 负责拿书稿逐章精读、答疑、出题、验收；人负责回答、讲出来、迁移到自己的真实事务。
+
+**七阶段**：备料（EPUB/PDF/OCR 三档拿全文）→ 开书前六问定目标 → AI 精读出章节地图 → 陪读答疑（先反问不给答案）→ 每章四输出验收 → 掌握度地图 0–5 考核 → 蒸馏入库 + 完读仪式。
+
+**特点**：
+- ✅ **零依赖**：只需要「能读文件 + 能对话」，任何 Agent 拿到就能用（Claude Code / Hermes / 其他均适配，含移植注意表）
+- ✅ **苏格拉底式答疑**：答错不给答案，换更窄的问题逼出推理矛盾（源头：Jane Street socratic-tutor）
+- ✅ **掌握度验收**：0–5 级地图 + 无提示回忆，「读完」不算学会，讲得出才算（源头：哈佛 194 人对照实验）
+- ✅ **两种模式**：教练模式（盯进度催打卡）/ 课代表模式（只陪聊不催），方法论书与人文书各得其所
+- ✅ 内置三份模板（开书六问 / 阅读进度 / 蒸馏验收），开箱即用
+
+**触发**：「陪我读 X」「我要读 X」「带我把 X 读透」「考考我这本书」
+
 ---
 
 ## 仓库结构
@@ -234,6 +250,8 @@ xiaomo-skills/
     ├── mycc/                          # 飞书远程操控后端
     │   ├── SKILL.md
     │   └── scripts/                   # 服务端代码
+    ├── book-tutor/                     # 读书陪读 AI 版（零依赖通用版）
+    │   └── SKILL.md                   # 七阶段陪读流程 + 模板 + 移植注意
     └── tao-skill/                     # 涛哥系列
         └── skills/
             ├── tao/                   # 中台入口
@@ -265,6 +283,10 @@ xiaomo-skills/
 - **[situk-yangtao-perspective](https://github.com/situker/situk-yangtao-perspective)** by 司徒K — README 排版参考
 - **[sk-info-assets](https://github.com/situker/sk-info-assets)** by 司徒K — 长文本信息资产分析框架
 - **涛哥系列思维框架**（由小mo推荐）— `tao` 及所有子 skill 的核心框架来源
+- **脱不花《怎样成为高效学习的人》**（得到 App）— `book-tutor` 阶段 A/D/F 的方法论骨架：开书四问、两轮笔记、四种输出、清单法、小步子原理
+- **[Jane Street `agent_skills`](https://github.com/janestreet/agent_skills)**（MIT）— `book-tutor` 阶段 C/E 的引擎：摸底定级、0–5 掌握度地图、只问不答的苏格拉底式教学
+- **Demis Hassabis WCIT 讲座 + 哈佛 Kestin & Miller 194 人对照实验**（*Scientific Reports*）— 倒置课堂分工与「验收靠无提示回忆」的实证依据
+- **一位朋友的读书方法分享** — 「书的电子版交给 AI → 逐章总结 → 答疑 → 出题考我」的原始闭环（`book-tutor` 的起点）
 
 ---
 
